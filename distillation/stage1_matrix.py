@@ -61,12 +61,13 @@ def train_stage1(
     student: BiMambaSLR,
     teacher: TeacherModel,
     dataloader: DataLoader,
+    val_dataloader: DataLoader = None,
     device: str = "cuda",
     lr: float = 1e-3,
     num_epochs: int = 10,
     log_freq: int = 50,
-    viz_freq: int = 2,            # visualize matrices every N epochs
-    viz_blocks: list = None,      # block indices to show (default: 4 evenly spaced)
+    viz_freq: int = 2,
+    viz_blocks: list = None,
     wandb_run=None,
     save_path: str = None,
 ):
@@ -142,13 +143,21 @@ def train_stage1(
         # ── Epoch-level logging ───────────────────────────────────────
         avg_loss = epoch_loss / len(dataloader)
         avg_frob = [f / len(dataloader) for f in frob_per_block]
-        print(f"[Stage1] Epoch {epoch+1} — avg loss: {avg_loss:.4f}")
+        print(f"[Stage1] Epoch {epoch+1}/{num_epochs} — train_loss: {avg_loss:.4f}")
+
+        # ── Validation loss ───────────────────────────────────────────
+        val_loss = None
+        if val_dataloader is not None:
+            val_loss = _compute_val_loss(student, teacher, val_dataloader, device, n_blocks)
+            print(f"[Stage1] Epoch {epoch+1}/{num_epochs} — val_loss:   {val_loss:.4f}")
 
         if wandb_run is not None:
             log_dict = {
-                "stage1/loss_epoch": avg_loss,
+                "stage1/train_loss": avg_loss,
                 "stage1/epoch":      epoch + 1,
             }
+            if val_loss is not None:
+                log_dict["stage1/val_loss"] = val_loss
             for l, fval in enumerate(avg_frob):
                 log_dict[f"stage1/frob_block_{l:02d}"] = fval
             wandb_run.log(log_dict, step=global_step)
@@ -165,6 +174,32 @@ def train_stage1(
         print(f"[Stage1] Checkpoint saved → {save_path}")
 
     return student
+
+
+@torch.no_grad()
+def _compute_val_loss(student, teacher, val_loader, device, n_blocks):
+    """Tính Frobenius loss trên validation set."""
+    student.eval()
+    total = 0.0
+    count = 0
+    for batch in val_loader:
+        x = _get_x(batch, device)
+        t_out = teacher(x, return_attn=True, return_hidden_states=True)
+        tm_teacher_all    = t_out["temporal_attn_matrices"]
+        teacher_hidden    = t_out["hidden_states"]
+
+        n = min(n_blocks, len(tm_teacher_all))
+        for l in range(n):
+            s_out = student.blocks[l](
+                hidden_states=teacher_hidden[l].to(device),
+                run_mlp_component=False,
+                return_transfer_matrix=True,
+            )
+            total += frobenius_loss(s_out["transfer_matrix"], tm_teacher_all[l].to(device)).item()
+            count += 1
+
+    student.train()
+    return total / max(count, 1)
 
 
 @torch.no_grad()

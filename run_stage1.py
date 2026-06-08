@@ -1,61 +1,48 @@
 """
 Chạy Stage 1: Transfer Matrix Alignment.
-
-Cách dùng:
-    python run_stage1.py
-
-Sửa các đường dẫn trong phần CONFIG bên dưới trước khi chạy.
+Cách dùng: python run_stage1.py
 """
 
-import compat  # PHẢI là dòng đầu tiên — inject torchvision stub trước mọi import
+import compat  # PHẢI là dòng đầu tiên
 
-import os
-import sys
+import os, sys, warnings, logging
+
+# ── Tắt toàn bộ warnings ──────────────────────────────────────────────
+warnings.filterwarnings("ignore")
+logging.disable(logging.CRITICAL)
+os.environ["PYTHONWARNINGS"]             = "ignore"
+os.environ["TOKENIZERS_PARALLELISM"]     = "false"
+os.environ["TRANSFORMERS_VERBOSITY"]     = "error"
+os.environ["LIGHTNING_DISABLE_WARNINGS"] = "1"
+
 import random
 import numpy as np
 import torch
 
 # ══════════════════════════════════════════════════════════════════════
-# CONFIG — chỉnh sửa các giá trị này
+# CONFIG
 # ══════════════════════════════════════════════════════════════════════
 
-# Đường dẫn teacher checkpoint (.ckpt từ Lightning)
 TEACHER_CKPT = os.path.expanduser(
     "~/sign-language-recognition/skeleton-slr-transformer-main"
     "/scripts/outputs/2026-06-04/16-23-19/checkpoints"
     "/epoch=1400-valid_loss=1.1588-valid_accuracy_PI@01=0.8254.ckpt"
 )
-
-# DataModule dùng path cứng './data/official_wlasl/splits/' và './data/official_wlasl/pose_per_individual_videos/'
-# Phải os.chdir() về thư mục CHA của folder data/ trước khi khởi tạo DataModule
-# Cấu trúc cần có:
-#   DATA_ROOT_PARENT/data/official_wlasl/splits/asl100.json
-#   DATA_ROOT_PARENT/data/official_wlasl/pose_per_individual_videos/
-#
-# Tạo symlink nếu chưa có:
-#   mkdir -p ~/slr-mamba-distill/data/official_wlasl
-#   ln -s ~/slr-mamba-distill/data/splits ~/slr-mamba-distill/data/official_wlasl/splits
-#   ln -s ~/slr-mamba-distill/data/pose_per_individual_videos ~/slr-mamba-distill/data/official_wlasl/pose_per_individual_videos
-DATA_ROOT_PARENT = os.path.expanduser("~/slr-mamba-distill")
-
-# Đường dẫn sstan source (để import dataset/model teacher)
-SSTAN_SRC = os.path.expanduser(
+SPLIT_FILE = os.path.expanduser("~/slr-mamba-distill/data/splits/splits/asl100.json")
+POSE_ROOT  = os.path.expanduser("~/slr-mamba-distill/data/pose_per_individual_videos")
+SSTAN_SRC  = os.path.expanduser(
     "~/sign-language-recognition/skeleton-slr-transformer-main/src"
 )
-
-# Thư mục lưu checkpoint student
 OUTPUT_DIR = "checkpoints"
 
 # ── Dataset — WLASL100 ────────────────────────────────────────────────
-SUBSET       = "asl100"   # wlasl100
-NUM_CLASSES  = 100        # sẽ được ghi đè bởi dm.num_classes
-SEQ_LEN      = 50
-N_JOINTS     = 55
-IN_CHANNELS  = 2
-BATCH_SIZE   = 8
-NUM_WORKERS  = 4
+SEQ_LEN     = 50
+N_JOINTS    = 55
+IN_CHANNELS = 2
+BATCH_SIZE  = 8
+NUM_WORKERS = 4
 
-# ── Teacher architecture (phải khớp với checkpoint) ───────────────────
+# ── Teacher (khớp checkpoint) ─────────────────────────────────────────
 EMBEDDING_DIM = 128
 N_BLOCKS      = 10
 HEAD_DIM      = 64
@@ -65,27 +52,27 @@ FFN_EXPAND    = 4.0
 FFN_DROPOUT   = 0.25
 MAX_STOCH     = 0.25
 
-# ── Student-only (BiMamba) ────────────────────────────────────────────
+# ── Student-only ──────────────────────────────────────────────────────
 D_STATE    = 64
 D_CONV     = 3
 CHUNK_SIZE = 16
 
-# ── Stage 1 training ─────────────────────────────────────────────────
-S1_EPOCHS  = 10
-S1_LR      = 1e-3
-LOG_FREQ   = 10    # print loss mỗi N steps
-VIZ_FREQ   = 2     # visualize matrices mỗi N epochs (cần --wandb)
+# ── Stage 1 ───────────────────────────────────────────────────────────
+S1_EPOCHS = 10
+S1_LR     = 1e-3
+LOG_FREQ  = 10
+VIZ_FREQ  = 2
 
-# ── Wandb (đặt True để log) ───────────────────────────────────────────
-USE_WANDB     = False
+# ── Wandb ─────────────────────────────────────────────────────────────
+USE_WANDB     = True
 WANDB_PROJECT = "slr-mamba-distill"
-WANDB_NAME    = "stage1-run1"
+WANDB_NAME    = "stage1-wlasl100"
 
-# ── Seed ─────────────────────────────────────────────────────────────
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ══════════════════════════════════════════════════════════════════════
+
 
 def seed_everything(seed):
     random.seed(seed)
@@ -98,7 +85,6 @@ def main():
     seed_everything(SEED)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # ── sstan vào sys.path ────────────────────────────────────────────
     if SSTAN_SRC not in sys.path:
         sys.path.insert(0, SSTAN_SRC)
 
@@ -106,8 +92,7 @@ def main():
     from models.student import BiMambaSLR
     from distillation.stage1_matrix import train_stage1
 
-    print(f"Device : {DEVICE}")
-    print(f"Torch  : {torch.__version__}")
+    print(f"Device : {DEVICE}  |  Torch : {torch.__version__}")
 
     # ── Wandb ─────────────────────────────────────────────────────────
     wandb_run = None
@@ -117,51 +102,73 @@ def main():
             project=WANDB_PROJECT,
             name=WANDB_NAME,
             config=dict(
-                stage=1, subset=SUBSET, num_classes=NUM_CLASSES,
-                seq_len=SEQ_LEN, n_joints=N_JOINTS,
+                stage=1, seq_len=SEQ_LEN, n_joints=N_JOINTS,
                 embedding_dim=EMBEDDING_DIM, n_blocks=N_BLOCKS,
-                n_heads=N_HEADS, d_state=D_STATE,
-                s1_epochs=S1_EPOCHS, s1_lr=S1_LR,
+                n_heads=N_HEADS, d_state=D_STATE, d_conv=D_CONV,
+                s1_epochs=S1_EPOCHS, s1_lr=S1_LR, batch_size=BATCH_SIZE,
             ),
+            settings=wandb.Settings(console="off"),  # tắt wandb console capture
         )
+        print(f"Wandb : {wandb_run.url}\n")
 
     # ── Dataset ───────────────────────────────────────────────────────
-    print("\nLoading dataset...")
+    print("Loading dataset...")
     try:
-        # DataModule hardcode './data/official_wlasl/...' → chdir về thư mục cha
-        os.chdir(DATA_ROOT_PARENT)
-        print(f"Working dir : {os.getcwd()}")
+        import json
+        from functools import partial
+        from torch.utils.data import DataLoader
+        from sstan.dataset import Sign_Dataset
+        from sstan.datamodule import collate_fn
 
-        from sstan.datamodule import WLASLOpenposeLightningDataModule
+        with open(SPLIT_FILE, "r") as f:
+            content = json.load(f)
+        glosses     = sorted(set(e["gloss"] for e in content))
+        num_classes = len(glosses)
+        print(f"Classes : {num_classes}  |  Split file : {SPLIT_FILE}")
 
-        dm = WLASLOpenposeLightningDataModule(
-            subset=SUBSET,
-            seq_len=SEQ_LEN,
+        train_dataset = Sign_Dataset(
+            index_file_path=SPLIT_FILE,
+            pose_root=POSE_ROOT,
+            split="train",
+            num_samples=SEQ_LEN,
             num_copies=1,
-            sampling_strategy={"train": "rnd_start", "valid": "k_copies", "test": "k_copies"},
-            train_data_augmentation=True,
-            batch_size=BATCH_SIZE,
-            num_workers=NUM_WORKERS,
+            sample_strategy="rnd_start",
+            skeleton_augmentation=True,
         )
-        dm.setup(stage="fit")
-        train_loader = dm.train_dataloader()
-        NUM_CLASSES = dm.num_classes   # cập nhật từ dataset thực tế
-        print(f"Train batches : {len(train_loader)}")
-        print(f"Num classes   : {NUM_CLASSES}")
+        val_dataset = Sign_Dataset(
+            index_file_path=SPLIT_FILE,
+            pose_root=POSE_ROOT,
+            split="val",
+            num_samples=SEQ_LEN,
+            num_copies=4,
+            sample_strategy="k_copies",
+            skeleton_augmentation=False,
+        )
+        _collate    = partial(collate_fn, num_classes=num_classes)
+        train_loader = DataLoader(
+            train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+            num_workers=NUM_WORKERS, collate_fn=_collate, drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=NUM_WORKERS, drop_last=False,
+        )
+        print(f"Train batches : {len(train_loader)}  |  Val batches : {len(val_loader)}")
+
     except Exception as e:
         import traceback; traceback.print_exc()
-        print(f"[ERROR] Không load được dataset: {e}")
+        print(f"[ERROR] Dataset: {e}")
         sys.exit(1)
 
     # ── Teacher ───────────────────────────────────────────────────────
-    print(f"\nLoading teacher từ:\n  {TEACHER_CKPT}")
+    print(f"\nLoading teacher...")
     if not os.path.exists(TEACHER_CKPT):
-        print(f"[ERROR] Không tìm thấy checkpoint: {TEACHER_CKPT}")
+        print(f"[ERROR] Checkpoint không tồn tại: {TEACHER_CKPT}")
         sys.exit(1)
 
     teacher = TeacherModel(
         checkpoint_path=TEACHER_CKPT,
-        num_classes=NUM_CLASSES,
+        num_classes=num_classes,
         in_channels=IN_CHANNELS,
         seq_len=SEQ_LEN,
         n_joints=N_JOINTS,
@@ -175,15 +182,14 @@ def main():
         max_stochastic_depth_rate=MAX_STOCH,
         device=DEVICE,
     )
-    teacher.to(DEVICE)
-    teacher.eval()
+    teacher.to(DEVICE).eval()
     print("Teacher loaded ✓")
 
     # ── Student ───────────────────────────────────────────────────────
     print("\nKhởi tạo student...")
     student = BiMambaSLR(
         in_channels=IN_CHANNELS,
-        num_classes=NUM_CLASSES,
+        num_classes=num_classes,
         seq_len=SEQ_LEN,
         n_joints=N_JOINTS,
         embedding_dim=EMBEDDING_DIM,
@@ -198,11 +204,10 @@ def main():
         d_conv=D_CONV,
         chunk_size=CHUNK_SIZE,
     )
+    total = sum(p.numel() for p in student.parameters())
+    print(f"Student params : {total:,}")
 
-    total   = sum(p.numel() for p in student.parameters())
-    print(f"Student params: {total:,}")
-
-    # ── Weight transfer Teacher → Student ─────────────────────────────
+    # ── Weight Transfer ───────────────────────────────────────────────
     print("\n=== Weight Transfer: Teacher → Student ===")
     student.load_teacher_weights(teacher)
 
@@ -212,6 +217,7 @@ def main():
         student=student,
         teacher=teacher,
         dataloader=train_loader,
+        val_dataloader=val_loader,
         device=DEVICE,
         lr=S1_LR,
         num_epochs=S1_EPOCHS,
@@ -221,8 +227,7 @@ def main():
         save_path=os.path.join(OUTPUT_DIR, "student_stage1.pth"),
     )
 
-    print(f"\n✓ Stage 1 hoàn thành. Checkpoint: {OUTPUT_DIR}/student_stage1.pth")
-
+    print(f"\n✓ Stage 1 xong. Checkpoint: {OUTPUT_DIR}/student_stage1.pth")
     if wandb_run is not None:
         wandb_run.finish()
 
