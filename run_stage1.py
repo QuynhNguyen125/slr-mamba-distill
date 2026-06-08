@@ -88,6 +88,10 @@ def main():
     if SSTAN_SRC not in sys.path:
         sys.path.insert(0, SSTAN_SRC)
 
+    # Patch sau khi sstan vào sys.path
+    import compat as _compat
+    _compat._patch_relative_position_attention()
+
     from models.teacher import TeacherModel
     from models.student import BiMambaSLR
     from distillation.stage1_matrix import train_stage1

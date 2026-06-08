@@ -11,6 +11,31 @@ import torch
 import torch.nn as nn
 
 
+def _patch_relative_position_attention():
+    """
+    Fix: compute_relative_positions tạo index trên CPU nhưng relative_position_bias_table
+    ở CUDA → device mismatch → CUDA device-side assert trong PyTorch 2.12.
+    Patch để index luôn ở cùng device với table.
+    """
+    try:
+        from sstan.models.transformers.modules.attention import (
+            RelativePositionalEncodeMultiHeadSelfAttention,
+        )
+
+        def _fixed_compute_relative_positions(self, seq_len):
+            device = self.relative_position_bias_table.device
+            range_vec = torch.arange(seq_len, device=device)
+            rel_pos_matrix = range_vec[:, None] - range_vec[None, :]
+            rel_pos_matrix = rel_pos_matrix + seq_len - 1
+            return rel_pos_matrix
+
+        RelativePositionalEncodeMultiHeadSelfAttention.compute_relative_positions = (
+            _fixed_compute_relative_positions
+        )
+    except ImportError:
+        pass  # sstan chưa có trong sys.path — sẽ được patch sau khi add vào path
+
+
 class _PureStochasticDepth(nn.Module):
     """Pure-PyTorch StochasticDepth — fallback khi torchvision broken."""
     def __init__(self, p: float, mode: str = "row"):
