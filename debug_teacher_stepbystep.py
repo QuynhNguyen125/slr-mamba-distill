@@ -58,7 +58,34 @@ except Exception as e:
 # Step 4: Create teacher
 print(f"\n[Step 4] Create teacher model")
 try:
+    # Find checkpoint
+    TEACHER_CKPT = os.path.expanduser(
+        "~/sign-language-recognition/skeleton-slr-transformer-main"
+        "/scripts/outputs/2026-06-04/16-23-19/checkpoints"
+        "/epoch=1400-valid_loss=1.1588-valid_accuracy_PI@01=0.8254.ckpt"
+    )
+    print(f"  Checkpoint: {TEACHER_CKPT}")
+    print(f"  Exists: {os.path.exists(TEACHER_CKPT)}")
+
+    if not os.path.exists(TEACHER_CKPT):
+        print("  ✗ Checkpoint not found!")
+        # Try to find alternative
+        print("  Searching for any .ckpt file...")
+        import glob
+        ckpts = glob.glob(os.path.expanduser("~/sign-language-recognition/**/epoch=*.ckpt"), recursive=True)
+        if ckpts:
+            TEACHER_CKPT = ckpts[0]
+            print(f"  Found: {TEACHER_CKPT}")
+        else:
+            print("  No checkpoint found!")
+            sys.exit(1)
+
     teacher = TeacherModel(
+        checkpoint_path=TEACHER_CKPT,
+        num_classes=100,
+        in_channels=2,
+        seq_len=50,
+        n_joints=55,
         embedding_dim=128,
         n_blocks=10,
         head_dim=64,
@@ -66,7 +93,8 @@ try:
         norm_type="batchnorm",
         ffn_expand_ratio=4.0,
         ffn_dropout_ratio=0.25,
-        max_stochastic_depth=0.25,
+        max_stochastic_depth_rate=0.25,
+        device=device,
     )
     print("  ✓ Created")
 
