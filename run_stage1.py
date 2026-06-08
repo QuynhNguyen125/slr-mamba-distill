@@ -7,34 +7,13 @@ Cách dùng:
 Sửa các đường dẫn trong phần CONFIG bên dưới trước khi chạy.
 """
 
+import compat  # PHẢI là dòng đầu tiên — inject torchvision stub trước mọi import
+
 import os
 import sys
 import random
 import numpy as np
 import torch
-import torch.nn as nn
-
-# ── Monkey-patch torchvision.ops.StochasticDepth ──────────────────────
-# torchvision C++ extension bị broken với torch 2.12.0+cu130.
-# Thay bằng pure-PyTorch trước khi bất kỳ code nào import torchvision.
-# Phải đặt TRƯỚC mọi import sstan/teacher.
-import torchvision.ops as _tvops
-
-class _PureStochasticDepth(nn.Module):
-    def __init__(self, p: float, mode: str = "row"):
-        super().__init__()
-        self.p = p
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.p == 0.0:
-            return x
-        survival = 1.0 - self.p
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        noise = torch.empty(shape, dtype=x.dtype, device=x.device)
-        noise = noise.bernoulli_(survival).div_(survival)
-        return x * noise
-
-_tvops.StochasticDepth = _PureStochasticDepth
-# ──────────────────────────────────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════════
 # CONFIG — chỉnh sửa các giá trị này
