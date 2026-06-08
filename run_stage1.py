@@ -88,12 +88,19 @@ def main():
     seed_everything(SEED)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # Add sstan to path FIRST
     if SSTAN_SRC not in sys.path:
         sys.path.insert(0, SSTAN_SRC)
 
-    # Patch sau khi sstan vào sys.path
-    import compat as _compat
-    _compat._patch_relative_position_attention()
+    # CRITICAL: Patch attention module BEFORE importing teacher
+    # This fixes CUDA device-side assert in compute_relative_positions
+    from patch_attention import patch_attention_module
+    patched = patch_attention_module()
+
+    if not patched:
+        print("[run_stage1] WARNING: Attention patch failed!")
+        print("  You will likely see CUDA device-side assert errors during teacher forward pass")
+        sys.exit(1)
 
     from models.teacher import TeacherModel
     from models.student import BiMambaSLR

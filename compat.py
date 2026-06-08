@@ -24,7 +24,7 @@ def _patch_relative_position_attention():
 
         def _fixed_compute_relative_positions(self, seq_len):
             device = self.relative_position_bias_table.device
-            range_vec = torch.arange(seq_len, device=device)
+            range_vec = torch.arange(seq_len, device=device, dtype=torch.long)
             rel_pos_matrix = range_vec[:, None] - range_vec[None, :]
             rel_pos_matrix = rel_pos_matrix + seq_len - 1
             return rel_pos_matrix
@@ -32,8 +32,15 @@ def _patch_relative_position_attention():
         RelativePositionalEncodeMultiHeadSelfAttention.compute_relative_positions = (
             _fixed_compute_relative_positions
         )
-    except ImportError:
-        pass  # sstan chưa có trong sys.path — sẽ được patch sau khi add vào path
+        print("[compat] ✓ Patched RelativePositionalEncodeMultiHeadSelfAttention.compute_relative_positions")
+        return True
+
+    except ImportError as e:
+        print(f"[compat] Could not patch attention (will retry): {e}")
+        return False  # sstan chưa có trong sys.path — sẽ được patch sau khi add vào path
+    except Exception as e:
+        print(f"[compat] Failed to patch attention: {e}")
+        return False
 
 
 class _PureStochasticDepth(nn.Module):
