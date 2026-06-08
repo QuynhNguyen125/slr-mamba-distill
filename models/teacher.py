@@ -53,6 +53,29 @@ def _load_lightning_state_dict(ckpt: dict) -> dict:
     return ckpt
 
 
+# ── Monkey-patch torchvision.ops.StochasticDepth ──────────────────────
+# Phải patch TRƯỚC khi import sstan vì postnorm_transformer.py dùng
+# torchvision.ops.StochasticDepth và C++ extension bị broken với torch 2.12+
+import torch.nn as _nn
+import torchvision.ops as _tvops
+
+class _PureStochasticDepth(_nn.Module):
+    def __init__(self, p: float, mode: str = "row"):
+        super().__init__()
+        self.p = p
+    def forward(self, x):
+        if not self.training or self.p == 0.0:
+            return x
+        survival = 1.0 - self.p
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        import torch as _torch
+        noise = _torch.empty(shape, dtype=x.dtype, device=x.device)
+        noise = noise.bernoulli_(survival).div_(survival)
+        return x * noise
+
+_tvops.StochasticDepth = _PureStochasticDepth
+# ──────────────────────────────────────────────────────────────────────
+
 from sstan.models.transformers.postnorm_transformer import (
     SpatialTemporalTransformerWithClassToken,
 )
