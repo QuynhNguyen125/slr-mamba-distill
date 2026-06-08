@@ -31,17 +31,16 @@ print("\n[Step 1b] Apply patch NGAY (trước khi import sstan)")
 import torch
 
 def patch_attention_before_import():
-    """Patch ngay khi sstan chưa import bất cứ cái gì."""
+    """Patch forward method để intercept lúc gọi - cách này chắc chắn work."""
     try:
-        # Import CHÍNH XÁC module chưa bị cache
+        # Import module
         from sstan.models.transformers.modules.attention import (
             RelativePositionalEncodeMultiHeadSelfAttention,
         )
 
-        # Lưu original
-        original = RelativePositionalEncodeMultiHeadSelfAttention.compute_relative_positions
+        print("  Imported RelativePositionalEncodeMultiHeadSelfAttention")
 
-        # Define fixed version
+        # Cách 1: Patch compute_relative_positions
         def compute_relative_positions_fixed(self, seq_len):
             """Fixed: Create indices on correct device."""
             device = self.relative_position_bias_table.device
@@ -49,11 +48,39 @@ def patch_attention_before_import():
             rel_pos_matrix = range_vec[:, None] - range_vec[None, :]
             return rel_pos_matrix + seq_len - 1
 
-        # Thay thế
-        RelativePositionalEncodeMultiHeadSelfAttention.compute_relative_positions = compute_relative_positions_fixed
+        RelativePositionalEncodeMultiHeadSelfAttention.compute_relative_positions = (
+            compute_relative_positions_fixed
+        )
+        print("  ✓ Patched compute_relative_positions")
 
-        print(f"  ✓ Patch applied: {compute_relative_positions_fixed}")
-        print(f"  Original method: {original}")
+        # Cách 2: THÊM patch forward để chắc chắn
+        original_forward = RelativePositionalEncodeMultiHeadSelfAttention.forward
+
+        def forward_with_device_fix(self, x, mask=None):
+            """Forward với fix: ensure compute_relative_positions uses correct device."""
+            # Force patch lần nữa (vì method có thể bị cache)
+            device = self.relative_position_bias_table.device
+
+            def compute_rel_pos_fixed(seq_len):
+                range_vec = torch.arange(seq_len, device=device, dtype=torch.long)
+                rel_pos_matrix = range_vec[:, None] - range_vec[None, :]
+                return rel_pos_matrix + seq_len - 1
+
+            # Tạm thời replace method
+            old_compute = self.compute_relative_positions
+            self.compute_relative_positions = compute_rel_pos_fixed.__get__(self, type(self))
+
+            try:
+                result = original_forward(self, x, mask)
+            finally:
+                # Restore
+                self.compute_relative_positions = old_compute
+
+            return result
+
+        RelativePositionalEncodeMultiHeadSelfAttention.forward = forward_with_device_fix
+        print("  ✓ Patched forward method (thêm layer bảo vệ)")
+
         return True
 
     except Exception as e:
