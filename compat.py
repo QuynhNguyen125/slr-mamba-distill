@@ -34,13 +34,18 @@ if not _already_patched:
             noise = noise.bernoulli_(survival).div_(survival)
             return x * noise
 
+    import importlib.machinery
+
     # Tạo fake torchvision.ops
     _tv_ops = types.ModuleType("torchvision.ops")
     _tv_ops.StochasticDepth = StochasticDepth
+    _tv_ops.__spec__ = importlib.machinery.ModuleSpec("torchvision.ops", None)
 
     # Tạo fake torchvision root
     _tv = types.ModuleType("torchvision")
     _tv.ops = _tv_ops
+    _tv.__version__ = "0.0.0+stub"
+    _tv.__spec__ = importlib.machinery.ModuleSpec("torchvision", None)
 
     # Inject vào sys.modules — mọi import torchvision sau đây sẽ dùng stub này
     sys.modules["torchvision"]      = _tv
