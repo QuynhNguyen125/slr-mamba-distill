@@ -181,11 +181,20 @@ class HybridB2TPostNormBlock(nn.Module):
         x = x.transpose(-2, -3).contiguous()    # (BM, T+1, V, D)
 
         if return_transfer_matrix:
-            H = tm_out["transfer_matrix"].shape[1]
-            # "transfer_matrix" key — shape (BM, V, H, T+1, T+1)
-            outputs["transfer_matrix"] = (
-                tm_out["transfer_matrix"].view(BM, V, H, T1, T1)
+            tm_matrix = tm_out["transfer_matrix"]  # (BM*V, H, L, L)
+            B_total, H, L_actual, _ = tm_matrix.shape
+
+            # Verify dimensions match
+            assert B_total == BM * V, (
+                f"Batch mismatch: expected {BM * V}, got {B_total}"
             )
+            assert L_actual == T1, (
+                f"Sequence length mismatch: expected {T1}, got {L_actual}. "
+                "This may indicate padding inconsistency between training/validation data."
+            )
+
+            # Safe reshape: (BM*V, H, L, L) -> (BM, V, H, L, L)
+            outputs["transfer_matrix"] = tm_matrix.view(BM, V, H, T1, T1)
 
         # ── 3. FFN — B2T PostNorm (unchanged from teacher) ───────────
         if run_mlp_component:

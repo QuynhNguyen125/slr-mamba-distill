@@ -106,6 +106,10 @@ def _materialize_transfer_matrix(
     """
     batch, L, H, S = B.shape
 
+    # Validate input shapes
+    assert A_log.shape == (batch, L, H), f"A_log shape mismatch: {A_log.shape} vs ({batch}, {L}, {H})"
+    assert C.shape == (batch, L, H, S), f"C shape mismatch: {C.shape} vs ({batch}, {L}, {H}, {S})"
+
     # A: (B, H, L)  — negative values ensure decay
     A_neg = rearrange(-F.softplus(A_log), "b l h -> b h l")
 
@@ -116,10 +120,16 @@ def _materialize_transfer_matrix(
     T_raw = torch.einsum("blhn,bshn,bhls->bhsl", C, B, powers)
     T = rearrange(T_raw, "b h s l -> b h l s")                # (B, H, L, L)
 
+    # Ensure T is contiguous before diagonal operations
+    if not T.is_contiguous():
+        T = T.contiguous()
+
     # D skip connection on diagonal (added once)
     if D is not None:
-        idx = torch.arange(L, device=D.device)
-        T[:, :, idx, idx] += D.view(1, H, 1)
+        assert D.shape[0] == H, f"D shape mismatch: {D.shape[0]} vs {H}"
+        # Use safe diagonal addition to avoid fancy indexing issues
+        for i in range(L):
+            T[:, :, i, i] = T[:, :, i, i] + D
 
     return T
 
