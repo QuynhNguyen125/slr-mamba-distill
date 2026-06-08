@@ -102,6 +102,7 @@ class TeacherModel(nn.Module):
         device: str = "cpu",
     ):
         super().__init__()
+        self.seq_len = seq_len  # ← Store seq_len for use in forward
 
         self.model = SpatialTemporalTransformerWithClassToken(
             in_channels=in_channels,
@@ -211,6 +212,11 @@ class TeacherModel(nn.Module):
         self._temporal_attn.clear()
         self._block_inputs.clear()
         self._block_outputs.clear()
+
+        # ── Truncate seq_len to match training (handle multi-crop val data) ──
+        max_len = self.seq_len + 1  # +1 for CLS token
+        if skeleton_data.shape[2] > max_len:  # shape: (B, C, T, V, M)
+            skeleton_data = skeleton_data[:, :, :max_len, :, :]
 
         with torch.no_grad():
             logits = self.model(skeleton_data)
