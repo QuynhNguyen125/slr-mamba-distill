@@ -1,54 +1,48 @@
 """
-Direct patch for SSTAN attention module to fix CUDA device mismatch in compute_relative_positions.
+Fix for SSTAN attention: ensure compute_relative_positions creates indices on correct device.
 
-This must be imported before any teacher model is instantiated.
+The problem: relative_position_bias_table stays on CPU after model.to(cuda)
+The solution: Create indices on the SAME device as relative_position_bias_table
 """
 
-import sys
 import torch
 
 
 def patch_attention_module():
     """
-    Patch the sstan attention module to fix CUDA device-side assert.
-
-    The original compute_relative_positions creates indices on CPU,
-    but relative_position_bias_table is on CUDA → device mismatch.
+    Patch compute_relative_positions to handle device correctly.
+    Indices must be created on the same device as relative_position_bias_table.
     """
     try:
-        # Try to import the attention module
         from sstan.models.transformers.modules import attention
 
-        # Check if we can find the RelativePositionalEncodeMultiHeadSelfAttention class
         if not hasattr(attention, 'RelativePositionalEncodeMultiHeadSelfAttention'):
-            print("[patch_attention] Class not found in attention module")
+            print("[patch_attention] Class not found")
             return False
 
         AttentionClass = attention.RelativePositionalEncodeMultiHeadSelfAttention
 
-        # Store original method
-        if hasattr(AttentionClass, '_original_compute_relative_positions'):
-            print("[patch_attention] Already patched, skipping")
+        # Check if already patched
+        if hasattr(AttentionClass, '_patched_device_fix'):
+            print("[patch_attention] Already patched")
             return True
 
-        original_method = AttentionClass.compute_relative_positions
-        AttentionClass._original_compute_relative_positions = original_method
+        # Save original
+        original_compute = AttentionClass.compute_relative_positions
 
         # Create fixed version
         def compute_relative_positions_fixed(self, seq_len):
             """
-            Fixed version: Create indices on same device as relative_position_bias_table.
+            Fixed: Create indices on SAME device as relative_position_bias_table.
 
-            Args:
-                seq_len: sequence length
-
-            Returns:
-                Relative position indices tensor on CUDA/CPU (same device as table)
+            This fixes the device mismatch error when:
+            - relative_position_bias_table is on CUDA
+            - but indices are created on CPU
             """
+            # KEY FIX: Get device from the table itself
             device = self.relative_position_bias_table.device
-            dtype = self.relative_position_bias_table.dtype
 
-            # Create range tensor on correct device
+            # Create range_vec on the CORRECT device
             range_vec = torch.arange(seq_len, device=device, dtype=torch.long)
 
             # Compute relative positions
@@ -59,20 +53,18 @@ def patch_attention_module():
 
         # Apply patch
         AttentionClass.compute_relative_positions = compute_relative_positions_fixed
+        AttentionClass._patched_device_fix = True
 
-        print("[patch_attention] ✓ Successfully patched compute_relative_positions")
+        print("[patch_attention] ✓ Patched compute_relative_positions for device consistency")
         return True
 
-    except ImportError as e:
-        print(f"[patch_attention] Could not import sstan attention module: {e}")
-        return False
     except Exception as e:
-        print(f"[patch_attention] Error during patching: {e}")
+        print(f"[patch_attention] Error: {e}")
         import traceback
         traceback.print_exc()
         return False
 
 
-# Try to patch immediately on import
+# Auto-patch on import
 if __name__ != "__main__":
     patch_attention_module()

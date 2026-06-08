@@ -93,14 +93,15 @@ def main():
         sys.path.insert(0, SSTAN_SRC)
 
     # CRITICAL: Patch attention module BEFORE importing teacher
-    # This fixes CUDA device-side assert in compute_relative_positions
+    # Fix: ensure compute_relative_positions creates indices on correct device
     from patch_attention import patch_attention_module
     patched = patch_attention_module()
 
     if not patched:
-        print("[run_stage1] WARNING: Attention patch failed!")
-        print("  You will likely see CUDA device-side assert errors during teacher forward pass")
+        print("[run_stage1] ERROR: Attention patch failed!")
         sys.exit(1)
+
+    print("[run_stage1] ✓ Attention patch applied successfully")
 
     from models.teacher import TeacherModel
     from models.student import BiMambaSLR
