@@ -170,7 +170,7 @@ except Exception as e:
 # Step 5: Create dummy input
 print(f"\n[Step 5] Create dummy input")
 try:
-    batch_size = 1
+    batch_size = 2  # Hạ từ 1 xuống 2
     n_frames = 51
     n_joints = 55
     in_channels = 2
