@@ -1,0 +1,25 @@
+# BiMambaSLR student configuration
+# Dimensions marked "MUST MATCH TEACHER" are required for distillation alignment.
+
+model:
+  in_channels: 2
+  num_classes: 100
+  seq_len: 50
+  n_joints: 55
+
+  # ── Must match teacher (postnorm_transformer.yaml) ─────────────────
+  embedding_dim: 128    # MUST MATCH TEACHER
+  n_blocks: 10          # MUST MATCH TEACHER
+  head_dim: 64          # MUST MATCH TEACHER (spatial MHA kept identical)
+  n_heads: 8            # MUST MATCH TEACHER
+  norm_type: batchnorm  # MUST MATCH TEACHER (BatchNorm2d, not LayerNorm)
+  ffn_expand_ratio: 4.0
+  ffn_dropout_ratio: 0.25
+  max_stochastic_depth_rate: 0.25
+  use_bias: false
+
+  # ── Student-only hyper-parameters (Mamba-specific) ────────────────
+  d_state: 64           # SSM state dimension (same default as phi-mamba)
+  d_conv: 3             # Depthwise conv kernel (odd → exact 'same' padding)
+  chunk_size: 16        # mamba_ssm chunk; sequences padded to next multiple
+                        # spatial L=55 → 64, temporal L=51 → 64

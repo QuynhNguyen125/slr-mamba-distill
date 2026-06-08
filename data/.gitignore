@@ -1,0 +1,12 @@
+# Ignore large dataset files — copy manually via scp/rsync
+data/
+official_wlasl/
+*.zip
+*.avi
+*.mp4
+*.pkl
+*.npy
+
+# Keep this folder and README
+!.gitignore
+!README.md

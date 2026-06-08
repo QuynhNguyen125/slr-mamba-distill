@@ -1,0 +1,19 @@
+torch>=2.0.0
+wandb>=0.17.0
+matplotlib>=3.8.0
+torchvision>=0.15.0
+einops>=0.7.0
+
+# Mamba SSM kernels (requires CUDA + triton)
+# Install: pip install mamba-ssm causal-conv1d
+mamba-ssm>=2.0.0
+numpy>=1.24.0
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# For sstan teacher / dataset
+lightning>=2.0.0
+torchmetrics>=1.0.0
+hydra-core>=1.3.0
+scikit-learn>=1.3.0
+opencv-python>=4.8.0

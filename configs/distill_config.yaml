@@ -1,0 +1,44 @@
+# Distillation configuration (MOHAWK 3-stage)
+
+teacher:
+  # Lightning checkpoint saved by train.py
+  checkpoint: "../skeleton-slr-transformer-main (1)/skeleton-slr-transformer-main/scripts/outputs/2026-06-04/16-23-19/checkpoints/epoch=1400-valid_loss=1.1588-valid_accuracy_PI@01=0.8254.ckpt"
+  # Architecture — must match postnorm_transformer.yaml
+  embedding_dim: 128
+  n_blocks: 10
+  head_dim: 64
+  n_heads: 8
+  norm_type: batchnorm
+
+data:
+  data_root: "/data/wlasl"        # root of WLASL skeleton JSON files
+  subset: "asl100"
+  num_classes: 100
+  seq_len: 50
+  n_joints: 55
+  in_channels: 2
+  batch_size: 16
+  num_workers: 4
+
+stage1:
+  epochs: 10
+  lr: 1.0e-3
+  # Trains: mixer weights only
+  # Loss: Frobenius(student_transfer_matrix, teacher_attention_matrix) per block
+
+stage2:
+  epochs: 10
+  lr: 5.0e-4
+  freeze_mlp: true    # true → mixer only;  false → mixer + FFN
+  # Loss: MSE(student_hidden_state, teacher_hidden_state) per block
+
+stage3:
+  epochs: 50
+  lr: 1.0e-4
+  alpha: 0.5           # KL weight; (1-alpha) is CE weight
+  temperature: 4.0     # knowledge distillation temperature
+  scheduler_patience: 5
+
+output_dir: "checkpoints/"
+seed: 42
+device: "cuda"
