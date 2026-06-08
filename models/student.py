@@ -48,6 +48,23 @@ from .mixers.bi_mamba2 import BiMamba2Mixer
 from .pos_encode import SinusoidalPositionalEncoding
 
 
+class StochasticDepth(nn.Module):
+    """Pure-PyTorch StochasticDepth — không phụ thuộc torchvision."""
+    def __init__(self, p: float):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0.0:
+            return x
+        # row mode: mỗi sample trong batch drop độc lập
+        survival = 1.0 - self.p
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        noise = torch.empty(shape, dtype=x.dtype, device=x.device)
+        noise = noise.bernoulli_(survival).div_(survival)
+        return x * noise
+
+
 def _apply_norm(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """
     Apply norm_layer to x: (BM, T+1, V, D).
@@ -100,8 +117,6 @@ class HybridB2TPostNormBlock(nn.Module):
         layer_idx: int = None,
     ):
         super().__init__()
-        import torchvision
-
         norm_cls = nn.BatchNorm2d if norm_type == "batchnorm" else nn.LayerNorm
 
         # ── Spatial MHA (identical to teacher) ───────────────────────
@@ -134,7 +149,7 @@ class HybridB2TPostNormBlock(nn.Module):
         self.norm_layer3 = norm_cls(embedding_dim)
 
         self.stochastic_depth = (
-            torchvision.ops.StochasticDepth(stochastic_depth_rate, mode="row")
+            StochasticDepth(stochastic_depth_rate)
             if stochastic_depth_rate > 0 else nn.Identity()
         )
 
