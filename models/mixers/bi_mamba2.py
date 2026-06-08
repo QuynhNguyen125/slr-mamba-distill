@@ -206,6 +206,16 @@ class BiMamba2Mixer(nn.Module):
         proj_dim = conv_dim + self.d_inner + n_heads
         self.in_proj = nn.Linear(d_model, proj_dim, bias=bias)
 
+        # Initialize weights with proper scaling
+        with torch.no_grad():
+            # Standard initialization for xBC and z parts
+            nn.init.normal_(self.in_proj.weight[:conv_dim + self.d_inner], std=1.0 / (d_model ** 0.5))
+            # A_log should map to values where softplus(A_log) ∈ (0.1, 1)
+            # This typically means A_log ∈ (-1, 0)
+            nn.init.uniform_(self.in_proj.weight[-n_heads:], a=-1.0, b=0.0)
+            if bias:
+                nn.init.zeros_(self.in_proj.bias)
+
         # ── Symmetric depthwise Conv1d (NOT causal) ──────────────────
         # padding='same' ensures output length == input length
         self.conv1d = nn.Conv1d(
@@ -241,6 +251,10 @@ class BiMamba2Mixer(nn.Module):
         batch, L, _ = u.shape
         conv_dim = self.d_inner + 2 * self.n_heads * self.d_state
 
+        # Input validation
+        assert not torch.isnan(u).any(), "Input u contains NaN values"
+        assert not torch.isinf(u).any(), "Input u contains Inf values"
+
         # Pad to nearest multiple of chunk_size for mamba_ssm kernel
         padded_L = ((L - 1) // self.chunk_size + 1) * self.chunk_size
         u_pad = F.pad(u, (0, 0, 0, padded_L - L))
@@ -250,6 +264,11 @@ class BiMamba2Mixer(nn.Module):
         xBC   = xBCzA[..., :conv_dim]
         z     = xBCzA[..., conv_dim : conv_dim + self.d_inner]
         A_log = xBCzA[..., conv_dim + self.d_inner :]           # (B, padded_L, H)
+
+        # Validate A_log range
+        A_softplus = F.softplus(A_log)
+        assert not torch.isnan(A_softplus).any(), f"softplus(A_log) contains NaN. A_log range: [{A_log.min():.4f}, {A_log.max():.4f}]"
+        assert not torch.isinf(A_softplus).any(), f"softplus(A_log) contains Inf. A_log range: [{A_log.min():.4f}, {A_log.max():.4f}]"
 
         # ── Symmetric depthwise Conv1d ────────────────────────────────
         xBC = F.silu(
@@ -283,7 +302,8 @@ class BiMamba2Mixer(nn.Module):
         C_ssm  = C_flat.view(batch, padded_L, self.n_heads, self.d_state)
 
         # Normalize values: x / softplus(A_log)  [SSD parameterization]
-        x_norm = x / F.softplus(A_log).unsqueeze(-1)
+        # Add epsilon for numerical stability
+        x_norm = x / (F.softplus(A_log).unsqueeze(-1) + 1e-6)
 
         # ── Fix 2 (cont.): mask x_norm before scan ────────────────────
         # Even after zeroing xBC above, apply an explicit 4-D mask to

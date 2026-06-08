@@ -3,9 +3,12 @@ Chạy Stage 1: Transfer Matrix Alignment.
 Cách dùng: python run_stage1.py
 """
 
-import compat  # PHẢI là dòng đầu tiên
-
 import os, sys, warnings, logging
+
+# CUDA_LAUNCH_BLOCKING phải được set TRƯỚC khi import torch
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+import compat  # inject torchvision stub
 
 # ── Tắt toàn bộ warnings ──────────────────────────────────────────────
 warnings.filterwarnings("ignore")
