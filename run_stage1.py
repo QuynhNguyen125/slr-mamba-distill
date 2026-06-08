@@ -166,7 +166,7 @@ def main():
         )
         val_loader = DataLoader(
             val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, drop_last=False,
+            num_workers=NUM_WORKERS, collate_fn=_collate, drop_last=False,
         )
         print(f"Train batches : {len(train_loader)}  |  Val batches : {len(val_loader)}")
 
