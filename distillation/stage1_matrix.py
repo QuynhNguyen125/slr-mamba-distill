@@ -200,7 +200,10 @@ def _log_matrix_viz(student, teacher, dataloader, device, viz_blocks, epoch, ste
 
 
 def _get_x(batch, device):
-    return (batch[0] if isinstance(batch, (list, tuple)) else batch).to(device).float()
+    # Batch có thể là dict {"skeleton_data": ..., "label": ...} hoặc tuple (x, label)
+    if isinstance(batch, dict):
+        return batch["skeleton_data"].to(device).float()
+    return batch[0].to(device).float()
 
 
 def _save(model, path):

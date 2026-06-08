@@ -26,8 +26,10 @@ TEACHER_CKPT = os.path.expanduser(
     "/epoch=1400-valid_loss=1.1588-valid_accuracy_PI@01=0.8254.ckpt"
 )
 
-# Đường dẫn data WLASL
-DATA_ROOT = os.path.expanduser("~/slr-mamba-distill/data")
+# Thư mục chứa folder data/ (DataModule dùng path cứng './data/official_wlasl/')
+# Tức là DATA_ROOT_PARENT/data/official_wlasl/ phải tồn tại
+DATA_ROOT_PARENT = os.path.expanduser("~/slr-mamba-distill/data")
+DATA_ROOT = DATA_ROOT_PARENT  # giữ để tương thích
 
 # Đường dẫn sstan source (để import dataset/model teacher)
 SSTAN_SRC = os.path.expanduser(
@@ -120,20 +122,29 @@ def main():
     print("\nLoading dataset...")
     try:
         from sstan.datamodule import WLASLMMPoseLightningDataModule
+
+        # DataModule dùng path cứng './data/official_wlasl/...'
+        # → phải chạy từ thư mục chứa folder data/
+        os.chdir(DATA_ROOT_PARENT)
+        print(f"Working dir: {os.getcwd()}")
+
         dm = WLASLMMPoseLightningDataModule(
-            data_dir=DATA_ROOT,
             subset=SUBSET,
             seq_len=SEQ_LEN,
             num_copies=1,
+            sampling_strategy={"train": "rnd_start", "valid": "k_copies", "test": "k_copies"},
+            train_data_augmentation=True,
             batch_size=BATCH_SIZE,
             num_workers=NUM_WORKERS,
         )
-        dm.setup()
+        dm.setup(stage="fit")
         train_loader = dm.train_dataloader()
-        print(f"Train batches: {len(train_loader)}")
+        NUM_CLASSES = dm.num_classes   # cập nhật từ dataset thực tế
+        print(f"Train batches : {len(train_loader)}")
+        print(f"Num classes   : {NUM_CLASSES}")
     except Exception as e:
+        import traceback; traceback.print_exc()
         print(f"[ERROR] Không load được dataset: {e}")
-        print("Kiểm tra lại DATA_ROOT và SSTAN_SRC")
         sys.exit(1)
 
     # ── Teacher ───────────────────────────────────────────────────────

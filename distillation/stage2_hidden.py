@@ -162,7 +162,9 @@ def train_stage2(
 
 
 def _get_x(batch, device):
-    return (batch[0] if isinstance(batch, (list, tuple)) else batch).to(device).float()
+    if isinstance(batch, dict):
+        return batch["skeleton_data"].to(device).float()
+    return batch[0].to(device).float()
 
 
 def _save(model, path):

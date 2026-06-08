@@ -144,6 +144,13 @@ def _save(model, path):
 
 
 def _get_x_labels(batch, device):
+    if isinstance(batch, dict):
+        x = batch["skeleton_data"].to(device).float()
+        label = batch["label"].to(device)
+        # label có thể là one-hot (float) → chuyển sang class index
+        if label.dim() > 1 and label.shape[-1] > 1:
+            label = label.argmax(dim=-1)
+        return x, label.long()
     if isinstance(batch, (list, tuple)) and len(batch) >= 2:
         return batch[0].to(device).float(), batch[1].to(device).long()
-    raise ValueError("Batch must be (skeleton_data, labels)")
+    raise ValueError("Batch phải là dict hoặc tuple (x, label)")
