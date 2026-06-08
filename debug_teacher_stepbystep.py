@@ -20,24 +20,54 @@ print(f"\nSetup:")
 print(f"  SSTAN_SRC: {SSTAN_SRC}")
 print(f"  Exists: {os.path.exists(SSTAN_SRC)}")
 
+# Step 1: Add sstan to path FIRST (nhưng chưa import)
+print("\n[Step 1] Add SSTAN to sys.path")
 if SSTAN_SRC not in sys.path:
     sys.path.insert(0, SSTAN_SRC)
+    print("  ✓ Added to path")
 
-# Step 1: Patch FIRST
-print("\n[Step 1] Apply patch BEFORE importing teacher")
-try:
-    from patch_attention import patch_attention_module
-    success = patch_attention_module()
-    if success:
-        print("  ✓ Patch applied successfully")
-    else:
-        print("  ✗ Patch failed")
-except Exception as e:
-    print(f"  ✗ Error: {e}")
+# Step 1b: Patch NGAY TRƯỚC KHI BẤT KỲ SSTAN MODULE NÀO ĐƯỢC IMPORT
+print("\n[Step 1b] Apply patch NGAY (trước khi import sstan)")
+import torch
+
+def patch_attention_before_import():
+    """Patch ngay khi sstan chưa import bất cứ cái gì."""
+    try:
+        # Import CHÍNH XÁC module chưa bị cache
+        from sstan.models.transformers.modules.attention import (
+            RelativePositionalEncodeMultiHeadSelfAttention,
+        )
+
+        # Lưu original
+        original = RelativePositionalEncodeMultiHeadSelfAttention.compute_relative_positions
+
+        # Define fixed version
+        def compute_relative_positions_fixed(self, seq_len):
+            """Fixed: Create indices on correct device."""
+            device = self.relative_position_bias_table.device
+            range_vec = torch.arange(seq_len, device=device, dtype=torch.long)
+            rel_pos_matrix = range_vec[:, None] - range_vec[None, :]
+            return rel_pos_matrix + seq_len - 1
+
+        # Thay thế
+        RelativePositionalEncodeMultiHeadSelfAttention.compute_relative_positions = compute_relative_positions_fixed
+
+        print(f"  ✓ Patch applied: {compute_relative_positions_fixed}")
+        print(f"  Original method: {original}")
+        return True
+
+    except Exception as e:
+        print(f"  ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+success = patch_attention_before_import()
+if not success:
+    print("  PATCH FAILED!")
     sys.exit(1)
 
-# Step 2: Import and check
-import torch
+# Step 2: Check PyTorch
 print(f"\n[Step 2] PyTorch info")
 print(f"  Version: {torch.__version__}")
 print(f"  CUDA available: {torch.cuda.is_available()}")
