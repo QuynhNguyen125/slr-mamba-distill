@@ -37,16 +37,29 @@ import torch.nn.functional as F
 from einops import rearrange
 
 # ── mamba_ssm kernels ──────────────────────────────────────────────────
+# Triton SSD kernel yêu cầu GPU compute capability >= 8.0 (Ampere+).
+# RTX Titan = cc 7.5 → dùng pure-PyTorch fallback thay thế.
+def _check_gpu_compatible() -> bool:
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        cc_major, _ = torch.cuda.get_device_capability(0)
+        if cc_major < 8:
+            print(f"[BiMamba2] GPU compute capability {cc_major}.x < 8.0 "
+                  f"— dùng PyTorch fallback (Triton không hỗ trợ cc7.x)")
+            return False
+        return True
+    except Exception:
+        return False
+
+_GPU_COMPATIBLE = _check_gpu_compatible()
+
 try:
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-    _HAS_MAMBA_SSM = True
+    _HAS_MAMBA_SSM = _GPU_COMPATIBLE   # chỉ dùng kernel nếu GPU tương thích
 except ImportError:
     _HAS_MAMBA_SSM = False
-    import warnings
-    warnings.warn(
-        "mamba_ssm not found; BiMamba2Mixer will use a pure-PyTorch fallback "
-        "(slower, for debugging only). Install mamba_ssm for training."
-    )
 
 
 # ── Non-causal segment sum (bidirectional, no tril, no masked_fill) ────
@@ -285,7 +298,11 @@ class BiMamba2Mixer(nn.Module):
 
         # ── Bidirectional SSM ─────────────────────────────────────────
         if _HAS_MAMBA_SSM:
-            y_fwd, y_bwd = self._scan_mamba_ssm(x_norm, A_log, B_ssm, C_ssm, padded_L)
+            try:
+                y_fwd, y_bwd = self._scan_mamba_ssm(x_norm, A_log, B_ssm, C_ssm, padded_L)
+            except Exception:
+                # Runtime fallback nếu Triton kernel vẫn lỗi
+                y_fwd, y_bwd = self._scan_pytorch(x_norm, A_log, B_ssm, C_ssm)
         else:
             y_fwd, y_bwd = self._scan_pytorch(x_norm, A_log, B_ssm, C_ssm)
 
