@@ -61,14 +61,16 @@ def patch_attention_before_import():
             # Force patch lần nữa (vì method có thể bị cache)
             device = self.relative_position_bias_table.device
 
-            def compute_rel_pos_fixed(seq_len):
+            def compute_rel_pos_fixed(this, seq_len):
+                """Fixed method - nhận self làm tham số đầu."""
                 range_vec = torch.arange(seq_len, device=device, dtype=torch.long)
                 rel_pos_matrix = range_vec[:, None] - range_vec[None, :]
                 return rel_pos_matrix + seq_len - 1
 
             # Tạm thời replace method
             old_compute = self.compute_relative_positions
-            self.compute_relative_positions = compute_rel_pos_fixed.__get__(self, type(self))
+            import types
+            self.compute_relative_positions = types.MethodType(compute_rel_pos_fixed, self)
 
             try:
                 result = original_forward(self, x, mask)
