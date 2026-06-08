@@ -26,10 +26,17 @@ TEACHER_CKPT = os.path.expanduser(
     "/epoch=1400-valid_loss=1.1588-valid_accuracy_PI@01=0.8254.ckpt"
 )
 
-# Thư mục chứa folder data/ (DataModule dùng path cứng './data/official_wlasl/')
-# Tức là DATA_ROOT_PARENT/data/official_wlasl/ phải tồn tại
-DATA_ROOT_PARENT = os.path.expanduser("~/slr-mamba-distill/data")
-DATA_ROOT = DATA_ROOT_PARENT  # giữ để tương thích
+# DataModule dùng path cứng './data/official_wlasl/splits/' và './data/official_wlasl/pose_per_individual_videos/'
+# Phải os.chdir() về thư mục CHA của folder data/ trước khi khởi tạo DataModule
+# Cấu trúc cần có:
+#   DATA_ROOT_PARENT/data/official_wlasl/splits/asl100.json
+#   DATA_ROOT_PARENT/data/official_wlasl/pose_per_individual_videos/
+#
+# Tạo symlink nếu chưa có:
+#   mkdir -p ~/slr-mamba-distill/data/official_wlasl
+#   ln -s ~/slr-mamba-distill/data/splits ~/slr-mamba-distill/data/official_wlasl/splits
+#   ln -s ~/slr-mamba-distill/data/pose_per_individual_videos ~/slr-mamba-distill/data/official_wlasl/pose_per_individual_videos
+DATA_ROOT_PARENT = os.path.expanduser("~/slr-mamba-distill")
 
 # Đường dẫn sstan source (để import dataset/model teacher)
 SSTAN_SRC = os.path.expanduser(
@@ -39,9 +46,9 @@ SSTAN_SRC = os.path.expanduser(
 # Thư mục lưu checkpoint student
 OUTPUT_DIR = "checkpoints"
 
-# ── Dataset ───────────────────────────────────────────────────────────
-SUBSET       = "asl100"
-NUM_CLASSES  = 100
+# ── Dataset — WLASL100 ────────────────────────────────────────────────
+SUBSET       = "asl100"   # wlasl100
+NUM_CLASSES  = 100        # sẽ được ghi đè bởi dm.num_classes
 SEQ_LEN      = 50
 N_JOINTS     = 55
 IN_CHANNELS  = 2
@@ -121,14 +128,13 @@ def main():
     # ── Dataset ───────────────────────────────────────────────────────
     print("\nLoading dataset...")
     try:
-        from sstan.datamodule import WLASLMMPoseLightningDataModule
-
-        # DataModule dùng path cứng './data/official_wlasl/...'
-        # → phải chạy từ thư mục chứa folder data/
+        # DataModule hardcode './data/official_wlasl/...' → chdir về thư mục cha
         os.chdir(DATA_ROOT_PARENT)
-        print(f"Working dir: {os.getcwd()}")
+        print(f"Working dir : {os.getcwd()}")
 
-        dm = WLASLMMPoseLightningDataModule(
+        from sstan.datamodule import WLASLOpenposeLightningDataModule
+
+        dm = WLASLOpenposeLightningDataModule(
             subset=SUBSET,
             seq_len=SEQ_LEN,
             num_copies=1,
