@@ -2,39 +2,53 @@
 Visualize transfer matrices (student) vs attention matrices (teacher)
 after Stage 1 distillation.
 
+4-panel approach — tổng quát cho Sign Language Recognition:
+
+  Panel A — CLS attention row
+      T[b, v, h, 0, 1:]  averaged over V joints  → (H, T) bar/heatmap
+      Cho biết: frame nào quan trọng nhất để phân loại, theo từng head
+
+  Panel B — Joint group attention
+      V=55 = body (0-12) + left_hand (13-33) + right_hand (34-54)
+      Average T over joints trong mỗi nhóm → 3 × (H_avg, T+1, T+1) matrices
+      Cho biết: mỗi vùng cơ thể tập trung vào khoảng thời gian nào
+
+  Panel C — Head diversity
+      Average T over V joints → (H, T+1, T+1) per head
+      Show all H=8 heads trong 1 grid → thấy mỗi head học gì khác nhau
+
+  Panel D — Teacher vs Student comparison
+      Head-averaged + joint-averaged → single (T+1, T+1) per block
+      Cộng thêm Frobenius distance bar chart
+      Quick check chất lượng distillation
+
 Usage
 -----
-python visualize_matrices.py \
-    --student_ckpt  checkpoints/student_stage1.pth \
-    --teacher_ckpt  "../skeleton-slr-transformer-main (1)/..." \
-    --data_root     /data/wlasl \
-    --subset        asl100 \
-    --num_classes   100 \
-    --blocks        0 3 6 9 \
-    --n_heads_show  0 1 \
-    --device        cuda
-
-Outputs:
-  - Per-block heatmap grid  (teacher | student | difference)
-  - Frobenius distance bar chart across all blocks
-  - Logged to wandb if --wandb is set
-  - Saved as PNG to --out_dir
+python visualize_matrices.py \\
+    --student_ckpt  checkpoints/student_stage1.pth \\
+    --split_file    data/splits/splits/asl100.json \\
+    --pose_root     data/pose_per_individual_videos \\
+    --num_classes   100 \\
+    --blocks        0 3 6 9 \\
+    --device        cuda \\
+    --out_dir       visualizations
 """
 
 import argparse
 import os
 import sys
-import math
 
+import numpy as np
 import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-import numpy as np
 
+# ── Path setup ────────────────────────────────────────────────────────
+_HERE = os.path.dirname(os.path.abspath(__file__))
 _TEACHER_SRC = os.path.join(
-    os.path.dirname(__file__), "..",
+    _HERE, "..",
     "skeleton-slr-transformer-main (1)",
     "skeleton-slr-transformer-main", "src",
 )
@@ -44,175 +58,330 @@ if _TEACHER_SRC not in sys.path:
 from models.student import BiMambaSLR
 from models.teacher import TeacherModel
 
+# ── Joint groups (V=55: 13 body + 21 left hand + 21 right hand) ──────
+JOINT_GROUPS = {
+    "body":       list(range(0,  13)),
+    "left_hand":  list(range(13, 34)),
+    "right_hand": list(range(34, 55)),
+}
+GROUP_COLORS = {"body": "Blues", "left_hand": "Greens", "right_hand": "Oranges"}
 
-# ──────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
 # Argument parsing
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--student_ckpt", required=True)
-    p.add_argument("--teacher_ckpt", default=os.path.join(
-        os.path.dirname(__file__), "..",
+    p.add_argument("--student_ckpt",  required=True)
+    p.add_argument("--teacher_ckpt",  default=os.path.join(
+        _HERE, "..",
         "skeleton-slr-transformer-main (1)",
         "skeleton-slr-transformer-main", "scripts", "outputs",
         "2026-06-04", "16-23-19", "checkpoints",
         "epoch=1400-valid_loss=1.1588-valid_accuracy_PI@01=0.8254.ckpt",
     ))
-    p.add_argument("--data_root",    required=True)
-    p.add_argument("--subset",       default="asl100")
-    p.add_argument("--num_classes",  type=int,   default=100)
-    p.add_argument("--seq_len",      type=int,   default=50)
-    p.add_argument("--n_joints",     type=int,   default=55)
-    p.add_argument("--embedding_dim",type=int,   default=128)
-    p.add_argument("--n_blocks",     type=int,   default=10)
-    p.add_argument("--head_dim",     type=int,   default=64)
-    p.add_argument("--n_heads",      type=int,   default=8)
-    p.add_argument("--norm_type",    default="batchnorm")
-    p.add_argument("--d_state",      type=int,   default=64)
-    p.add_argument("--d_conv",       type=int,   default=3)
-    p.add_argument("--chunk_size",   type=int,   default=16)
-    p.add_argument("--batch_size",   type=int,   default=4)
-    p.add_argument("--num_workers",  type=int,   default=2)
-    p.add_argument("--device",       default="cuda")
-
-    # Visualization options
-    p.add_argument("--blocks",       type=int, nargs="+", default=[0, 3, 6, 9],
-                   help="Block indices to visualize")
-    p.add_argument("--n_heads_show", type=int, nargs="+", default=[0, 1],
-                   help="Head indices to show per block")
-    p.add_argument("--sample_idx",   type=int, default=0,
-                   help="Which sample in the batch to visualize")
-    p.add_argument("--joint_idx",    type=int, default=0,
-                   help="Which V-joint index to show for temporal matrix")
-    p.add_argument("--out_dir",      default="visualizations")
-    p.add_argument("--wandb",        action="store_true")
-    p.add_argument("--wandb_project",default="slr-mamba-distill")
-    p.add_argument("--wandb_run",    default="matrix-visualization")
+    p.add_argument("--split_file",    required=True)
+    p.add_argument("--pose_root",     required=True)
+    p.add_argument("--num_classes",   type=int,   default=100)
+    p.add_argument("--seq_len",       type=int,   default=50)
+    p.add_argument("--n_joints",      type=int,   default=55)
+    p.add_argument("--embedding_dim", type=int,   default=128)
+    p.add_argument("--n_blocks",      type=int,   default=10)
+    p.add_argument("--head_dim",      type=int,   default=64)
+    p.add_argument("--n_heads",       type=int,   default=8)
+    p.add_argument("--norm_type",     default="batchnorm")
+    p.add_argument("--d_state",       type=int,   default=64)
+    p.add_argument("--d_conv",        type=int,   default=3)
+    p.add_argument("--chunk_size",    type=int,   default=16)
+    p.add_argument("--batch_size",    type=int,   default=4)
+    p.add_argument("--num_workers",   type=int,   default=2)
+    p.add_argument("--device",        default="cuda")
+    p.add_argument("--blocks",        type=int, nargs="+", default=[0, 3, 6, 9])
+    p.add_argument("--sample_idx",    type=int,   default=0)
+    p.add_argument("--out_dir",       default="visualizations")
+    p.add_argument("--wandb",         action="store_true")
+    p.add_argument("--wandb_project", default="slr-mamba-distill")
     return p.parse_args()
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 # Matrix collection
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def collect_matrices(student, teacher, x, device):
     """
-    Run one forward pass and return:
+    Returns:
         teacher_attn  : list[n_blocks] of (BM, V, H, T+1, T+1)
         student_trans : list[n_blocks] of (BM, V, H, T+1, T+1)
         frob_per_block: list[float]
     """
     x = x.to(device)
-
-    # Teacher
     t_out = teacher(x, return_attn=True, return_hidden_states=True)
-    teacher_attn   = t_out["temporal_attn_matrices"]  # list[n_blocks]
-    teacher_hidden = t_out["hidden_states"]            # list[n_blocks]
+    teacher_attn   = t_out["temporal_attn_matrices"]
+    teacher_hidden = t_out["hidden_states"]
 
-    # Student — layer by layer (same as Stage 1)
     student.eval()
-    student_trans = []
+    student_trans  = []
     frob_per_block = []
 
     n = min(len(student.blocks), len(teacher_attn))
     for l in range(n):
-        student_input = teacher_hidden[l].to(device)
         s_out = student.blocks[l](
-            hidden_states=student_input,
+            hidden_states=teacher_hidden[l].to(device),
             run_mlp_component=False,
             return_transfer_matrix=True,
         )
-        tm_s = s_out["transfer_matrix"]                        # (BM, V, H, T+1, T+1)
-        tm_t = teacher_attn[l].to(device)                     # (BM, V, H, T+1, T+1)
-
+        tm_s = s_out["transfer_matrix"].cpu()
+        tm_t = teacher_attn[l].cpu()
         frob = torch.linalg.matrix_norm(tm_s - tm_t, ord="fro").mean().item()
-        student_trans.append(tm_s.cpu())
+        student_trans.append(tm_s)
         frob_per_block.append(frob)
 
     teacher_attn_cpu = [m.cpu() for m in teacher_attn]
     return teacher_attn_cpu, student_trans, frob_per_block
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Plotting helpers
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════
 
-def _matrix_to_numpy(tensor, b, v, h):
-    """Extract (T+1, T+1) numpy array for sample b, joint v, head h."""
-    return tensor[b, v, h].float().numpy()
+def _np(t: torch.Tensor) -> np.ndarray:
+    return t.float().numpy()
 
 
-def plot_block_comparison(
-    block_idx, teacher_tm, student_tm,
-    sample_idx, joint_idx, heads_show,
-    frob_val,
-):
+def _avg_joints(mat: torch.Tensor, joint_indices) -> torch.Tensor:
+    """Average (BM, V, H, L, L) over selected joint indices → (BM, H, L, L)."""
+    return mat[:, joint_indices, :, :, :].mean(dim=1)
+
+
+def _imshow(ax, data, cmap="Blues", vmin=None, vmax=None, title=""):
+    im = ax.imshow(data, aspect="auto", cmap=cmap,
+                   vmin=vmin, vmax=vmax, interpolation="nearest")
+    ax.set_title(title, fontsize=8)
+    ax.set_xlabel("Source frame", fontsize=7)
+    ax.set_ylabel("Query frame",  fontsize=7)
+    ax.tick_params(labelsize=6)
+    return im
+
+
+def _colorbar(fig, ax, im):
+    cb = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.03)
+    cb.ax.tick_params(labelsize=6)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Panel A — CLS attention row
+# ══════════════════════════════════════════════════════════════════════
+
+def plot_cls_attention(block_idx, teacher_tm, student_tm, sample_idx):
     """
-    One figure per block with columns = (teacher | student | difference)
-    and rows = selected heads.
+    T[b, :, h, 0, 1:] averaged over V joints → (H, T) bar chart.
+    Row 0 = CLS token, columns 1.. = real frames.
+
+    Cho biết: mỗi head tập trung vào frame nào khi đưa ra prediction.
+    Teacher (softmax attention) vs Student (SSM transfer matrix).
     """
-    n_rows = len(heads_show)
-    fig, axes = plt.subplots(
-        n_rows, 3,
-        figsize=(12, 4 * n_rows),
-        squeeze=False,
-    )
+    BM, V, H, L, _ = teacher_tm.shape
+    b = min(sample_idx, BM - 1)
+    T = L - 1   # exclude CLS slot itself
+
+    # Average CLS row over all V joints → (H, T)
+    t_cls = teacher_tm[b, :, :, 0, 1:].mean(dim=0).numpy()   # (H, T)
+    s_cls = student_tm[b, :, :, 0, 1:].mean(dim=0).numpy()   # (H, T)
+
+    fig, axes = plt.subplots(H, 2, figsize=(14, 2 * H), squeeze=False)
     fig.suptitle(
-        f"Block {block_idx}  —  Frobenius distance: {frob_val:.4f}",
-        fontsize=14, fontweight="bold",
+        f"Panel A — CLS token attention row  (Block {block_idx})\n"
+        f"Trung bình qua V={V} joints — mỗi head tập trung vào frame nào",
+        fontsize=11, fontweight="bold",
     )
 
-    for row, h in enumerate(heads_show):
-        t_mat = _matrix_to_numpy(teacher_tm, sample_idx, joint_idx, h)
-        s_mat = _matrix_to_numpy(student_tm, sample_idx, joint_idx, h)
+    for h in range(H):
+        t_row = t_cls[h]   # (T,)
+        s_row = s_cls[h]   # (T,)
+        frames = np.arange(T)
+
+        for col, (row, label, color) in enumerate([
+            (t_row, f"Teacher — head {h}", "steelblue"),
+            (s_row, f"Student — head {h}", "tomato"),
+        ]):
+            ax = axes[h][col]
+            ax.bar(frames, row, color=color, alpha=0.8, width=0.9)
+            ax.set_xlim(-0.5, T - 0.5)
+            ax.set_title(label, fontsize=8)
+            ax.set_xlabel("Frame index", fontsize=7)
+            ax.set_ylabel("Weight", fontsize=7)
+            ax.tick_params(labelsize=6)
+
+    plt.tight_layout()
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Panel B — Joint group attention
+# ══════════════════════════════════════════════════════════════════════
+
+def plot_joint_group_attention(block_idx, teacher_tm, student_tm, sample_idx):
+    """
+    Chia V=55 joints thành 3 nhóm: body, left_hand, right_hand.
+    Với mỗi nhóm: average over joints + average over heads → (L, L) matrix.
+
+    Cho biết: vùng cơ thể nào tập trung vào khoảng thời gian nào.
+    """
+    BM, V, H, L, _ = teacher_tm.shape
+    b = min(sample_idx, BM - 1)
+
+    groups = list(JOINT_GROUPS.items())   # [("body", [...]), ...]
+    n_groups = len(groups)
+
+    fig, axes = plt.subplots(n_groups, 3, figsize=(14, 4 * n_groups), squeeze=False)
+    fig.suptitle(
+        f"Panel B — Joint group attention  (Block {block_idx})\n"
+        f"Trung bình trong mỗi nhóm khớp, trung bình qua H={H} heads",
+        fontsize=11, fontweight="bold",
+    )
+
+    for row, (grp_name, grp_idx) in enumerate(groups):
+        # (H, L, L) → average over H → (L, L)
+        t_mat = _np(_avg_joints(teacher_tm, grp_idx)[b].mean(dim=0))
+        s_mat = _np(_avg_joints(student_tm, grp_idx)[b].mean(dim=0))
         d_mat = s_mat - t_mat
 
         vmin_ts = min(t_mat.min(), s_mat.min())
         vmax_ts = max(t_mat.max(), s_mat.max())
-        abs_d   = np.abs(d_mat).max()
+        abs_d   = max(np.abs(d_mat).max(), 1e-8)
+        cmap    = GROUP_COLORS[grp_name]
 
-        for col, (mat, title, cmap, vmin, vmax) in enumerate([
-            (t_mat, f"Teacher attn  (head {h})", "Blues",  vmin_ts, vmax_ts),
-            (s_mat, f"Student Mamba (head {h})", "Blues",  vmin_ts, vmax_ts),
-            (d_mat, f"Difference",               "RdBu_r", -abs_d,  abs_d),
+        for col, (mat, title, cm, vlo, vhi) in enumerate([
+            (t_mat, f"Teacher — {grp_name}",  cmap,    vmin_ts, vmax_ts),
+            (s_mat, f"Student — {grp_name}",  cmap,    vmin_ts, vmax_ts),
+            (d_mat, f"Diff  — {grp_name}",    "RdBu_r", -abs_d,  abs_d),
         ]):
-            ax = axes[row][col]
-            im = ax.imshow(mat, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
-            ax.set_title(title, fontsize=10)
-            ax.set_xlabel("Source position")
-            ax.set_ylabel("Query position")
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax  = axes[row][col]
+            im  = _imshow(ax, mat, cm, vlo, vhi, title)
+            _colorbar(fig, ax, im)
 
     plt.tight_layout()
     return fig
 
 
-def plot_frobenius_bar(frob_per_block):
-    """Bar chart of Frobenius distance per block."""
-    fig, ax = plt.subplots(figsize=(max(8, len(frob_per_block)), 4))
-    x = list(range(len(frob_per_block)))
-    bars = ax.bar(x, frob_per_block, color="steelblue", edgecolor="white")
-    ax.set_xlabel("Block index")
-    ax.set_ylabel("Frobenius distance")
-    ax.set_title("Per-block Frobenius distance: Student transfer matrix vs Teacher attention")
-    ax.set_xticks(x)
+# ══════════════════════════════════════════════════════════════════════
+# Panel C — Head diversity
+# ══════════════════════════════════════════════════════════════════════
+
+def plot_head_diversity(block_idx, teacher_tm, student_tm, sample_idx):
+    """
+    Average over V joints, show mỗi head riêng → (H, L, L) grid.
+    Mỗi cột = 1 head, hàng trên = teacher, hàng dưới = student.
+
+    Cho biết: mỗi head chuyên về pattern thời gian gì (local vs global,
+    early vs late, diagonal vs long-range).
+    """
+    BM, V, H, L, _ = teacher_tm.shape
+    b = min(sample_idx, BM - 1)
+
+    # Average over all V joints → (H, L, L)
+    t_all = _np(teacher_tm[b].mean(dim=0))   # (H, L, L)
+    s_all = _np(student_tm[b].mean(dim=0))   # (H, L, L)
+
+    fig, axes = plt.subplots(2, H, figsize=(2.5 * H, 6), squeeze=False)
+    fig.suptitle(
+        f"Panel C — Head diversity  (Block {block_idx})\n"
+        f"Trung bình qua V={V} joints — hàng trên = Teacher, hàng dưới = Student",
+        fontsize=11, fontweight="bold",
+    )
+
+    for h in range(H):
+        t_mat = t_all[h]
+        s_mat = s_all[h]
+        vmin  = min(t_mat.min(), s_mat.min())
+        vmax  = max(t_mat.max(), s_mat.max())
+
+        im_t = _imshow(axes[0][h], t_mat, "Blues", vmin, vmax, f"Teacher h{h}")
+        im_s = _imshow(axes[1][h], s_mat, "Reds",  vmin, vmax, f"Student h{h}")
+        _colorbar(fig, axes[0][h], im_t)
+        _colorbar(fig, axes[1][h], im_s)
+
+    plt.tight_layout()
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Panel D — Teacher vs Student summary + Frobenius
+# ══════════════════════════════════════════════════════════════════════
+
+def plot_summary_comparison(teacher_attn_all, student_trans_all, frob_per_block,
+                             blocks_show, sample_idx):
+    """
+    Mỗi block được show bằng 1 matrix duy nhất: average over V + average over H.
+    Columns: teacher | student | difference.
+    Thêm Frobenius distance bar chart ở cuối.
+
+    Cho biết: nhanh nhất về chất lượng distillation tổng thể.
+    """
+    n = len(blocks_show)
+    fig = plt.figure(figsize=(14, 4 * n + 4))
+    gs  = gridspec.GridSpec(n + 1, 3, figure=fig, hspace=0.45, wspace=0.35)
+
+    fig.suptitle(
+        "Panel D — Summary: Teacher vs Student  (avg over all joints & heads)\n"
+        "Nhanh nhất để đánh giá chất lượng distillation mỗi block",
+        fontsize=11, fontweight="bold",
+    )
+
+    for row, l in enumerate(blocks_show):
+        if l >= len(teacher_attn_all):
+            continue
+        BM, V, H, L, _ = teacher_attn_all[l].shape
+        b = min(sample_idx, BM - 1)
+
+        # Average over V joints and H heads → (L, L)
+        t_mat = _np(teacher_attn_all[l][b].mean(dim=(0, 1)))   # (L, L)
+        s_mat = _np(student_trans_all[l][b].mean(dim=(0, 1)))   # (L, L)
+        d_mat = s_mat - t_mat
+
+        vmin_ts = min(t_mat.min(), s_mat.min())
+        vmax_ts = max(t_mat.max(), s_mat.max())
+        abs_d   = max(np.abs(d_mat).max(), 1e-8)
+        frob    = frob_per_block[l] if l < len(frob_per_block) else 0.0
+
+        for col, (mat, title, cm, vlo, vhi) in enumerate([
+            (t_mat, f"Teacher  block {l}",  "Blues",  vmin_ts, vmax_ts),
+            (s_mat, f"Student  block {l}",  "Blues",  vmin_ts, vmax_ts),
+            (d_mat, f"Diff  (Frob={frob:.3f})", "RdBu_r", -abs_d,  abs_d),
+        ]):
+            ax = fig.add_subplot(gs[row, col])
+            im = _imshow(ax, mat, cm, vlo, vhi, title)
+            _colorbar(fig, ax, im)
+
+    # Frobenius bar chart — last row spans all 3 columns
+    ax_bar = fig.add_subplot(gs[n, :])
+    x    = list(range(len(frob_per_block)))
+    bars = ax_bar.bar(x, frob_per_block, color="steelblue", edgecolor="white")
+    ax_bar.set_xlabel("Block index", fontsize=9)
+    ax_bar.set_ylabel("Frobenius distance", fontsize=9)
+    ax_bar.set_title("Frobenius distance per block", fontsize=10)
+    ax_bar.set_xticks(x)
     for bar, val in zip(bars, frob_per_block):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.001,
-                f"{val:.3f}", ha="center", va="bottom", fontsize=8)
-    plt.tight_layout()
+        ax_bar.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(frob_per_block) * 0.01,
+            f"{val:.3f}", ha="center", va="bottom", fontsize=7,
+        )
+
     return fig
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 # Main
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
 
 def main():
-    args = get_args()
-    os.makedirs(args.out_dir, exist_ok=True)
+    args   = get_args()
     device = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
+    os.makedirs(args.out_dir, exist_ok=True)
 
     # ── wandb ────────────────────────────────────────────────────────
     run = None
@@ -220,11 +389,12 @@ def main():
         import wandb
         run = wandb.init(
             project=args.wandb_project,
-            name=args.wandb_run,
+            name="matrix-visualization",
             config=vars(args),
         )
 
     # ── Models ───────────────────────────────────────────────────────
+    print("Loading teacher...")
     teacher = TeacherModel(
         checkpoint_path=args.teacher_ckpt,
         num_classes=args.num_classes,
@@ -237,8 +407,9 @@ def main():
         norm_type=args.norm_type,
         device=device,
     )
-    teacher.eval()
+    teacher.to(device).eval()
 
+    print("Loading student...")
     student = BiMambaSLR(
         num_classes=args.num_classes,
         seq_len=args.seq_len,
@@ -252,83 +423,106 @@ def main():
         d_conv=args.d_conv,
         chunk_size=args.chunk_size,
     )
-    ckpt = torch.load(args.student_ckpt, map_location=device)
+    ckpt = torch.load(args.student_ckpt, map_location=device, weights_only=False)
     student.load_state_dict(ckpt.get("model_state_dict", ckpt))
-    student.to(device)
-    student.eval()
+    student.to(device).eval()
 
-    # ── One sample batch ─────────────────────────────────────────────
+    # ── Data ─────────────────────────────────────────────────────────
+    print("Loading one batch...")
     try:
-        from sstan.datamodule import WLASLMMPoseLightningDataModule
-        dm = WLASLMMPoseLightningDataModule(
-            data_dir=args.data_root, subset=args.subset,
-            seq_len=args.seq_len, num_copies=1,
-            batch_size=args.batch_size, num_workers=args.num_workers,
-        )
-        dm.setup()
-        batch = next(iter(dm.val_dataloader()))
-    except Exception as e:
-        print(f"[WARNING] Could not load dataset ({e}). Using random input.")
-        batch = (torch.randn(args.batch_size, 2, args.seq_len, args.n_joints, 1),)
+        import json
+        from functools import partial
+        from torch.utils.data import DataLoader
+        from sstan.dataset import Sign_Dataset
+        from sstan.datamodule import collate_fn
 
-    x = batch[0].float()
+        with open(args.split_file) as f:
+            content = json.load(f)
+        num_classes = len(sorted(set(e["gloss"] for e in content)))
+        _collate = partial(collate_fn, num_classes=num_classes)
+
+        ds = Sign_Dataset(
+            index_file_path=args.split_file,
+            pose_root=args.pose_root,
+            split="val",
+            num_samples=args.seq_len,
+            num_copies=1,
+            sample_strategy="seq",
+            skeleton_augmentation=False,
+        )
+        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, collate_fn=_collate)
+        batch = next(iter(loader))
+        x = batch["skeleton_data"].float()
+    except Exception as e:
+        print(f"[WARNING] Dataset failed ({e}). Dùng random input.")
+        x = torch.randn(args.batch_size, 2, args.seq_len, args.n_joints, 1)
+
     print(f"Input shape: {x.shape}")
 
-    # ── Collect matrices ──────────────────────────────────────────────
-    print("Collecting matrices...")
+    # ── Collect ──────────────────────────────────────────────────────
+    print("Collecting matrices (forward pass)...")
     teacher_attn, student_trans, frob_per_block = collect_matrices(
         student, teacher, x, device
     )
 
     print("\nFrobenius distances per block:")
     for i, d in enumerate(frob_per_block):
-        print(f"  Block {i:2d}: {d:.4f}")
+        bar = "█" * int(d * 20)
+        print(f"  Block {i:2d}: {d:.4f}  {bar}")
 
-    # ── Frobenius summary bar chart ───────────────────────────────────
-    fig_bar = plot_frobenius_bar(frob_per_block)
-    bar_path = os.path.join(args.out_dir, "frobenius_per_block.png")
-    fig_bar.savefig(bar_path, dpi=150, bbox_inches="tight")
-    plt.close(fig_bar)
-    print(f"Saved: {bar_path}")
+    blocks_show = [b for b in args.blocks if b < len(frob_per_block)]
+    bidx        = min(args.sample_idx, x.shape[0] - 1)
 
-    if run is not None:
-        import wandb
-        run.log({"frobenius/bar_chart": wandb.Image(bar_path)})
-        for i, d in enumerate(frob_per_block):
-            run.log({f"frobenius/block_{i:02d}": d})
-
-    # ── Per-block heatmaps ────────────────────────────────────────────
-    blocks_to_show = [b for b in args.blocks if b < len(frob_per_block)]
-    b_idx  = min(args.sample_idx, x.shape[0] - 1)
-    # joint_idx: clamp to V dimension after BM reshape
-    BM = x.shape[0] * x.shape[-1]
-    v_idx  = min(args.joint_idx, args.n_joints - 1)
-    # re-index to (BM, V, H, T+1, T+1) shape
-    bm_idx = b_idx  # M=1 so BM=B
-
-    for l in blocks_to_show:
-        fig = plot_block_comparison(
-            block_idx   = l,
-            teacher_tm  = teacher_attn[l],
-            student_tm  = student_trans[l],
-            sample_idx  = bm_idx,
-            joint_idx   = v_idx,
-            heads_show  = args.n_heads_show,
-            frob_val    = frob_per_block[l],
-        )
-        out_path = os.path.join(args.out_dir, f"block_{l:02d}.png")
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    # ── Panel A: CLS attention row ────────────────────────────────────
+    print("\nPanel A — CLS attention row...")
+    for l in blocks_show:
+        fig = plot_cls_attention(l, teacher_attn[l], student_trans[l], bidx)
+        path = os.path.join(args.out_dir, f"panelA_block{l:02d}_cls_attention.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
-        print(f"Saved: {out_path}")
+        print(f"  Saved: {path}")
+        if run:
+            import wandb; run.log({f"A_cls/block_{l:02d}": wandb.Image(path)})
 
-        if run is not None:
-            import wandb
-            run.log({f"matrices/block_{l:02d}": wandb.Image(out_path)})
+    # ── Panel B: Joint group attention ───────────────────────────────
+    print("\nPanel B — Joint group attention...")
+    for l in blocks_show:
+        fig = plot_joint_group_attention(l, teacher_attn[l], student_trans[l], bidx)
+        path = os.path.join(args.out_dir, f"panelB_block{l:02d}_joint_groups.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {path}")
+        if run:
+            import wandb; run.log({f"B_groups/block_{l:02d}": wandb.Image(path)})
 
-    # ── Summary stats ─────────────────────────────────────────────────
-    mean_frob = sum(frob_per_block) / len(frob_per_block)
-    print(f"\nMean Frobenius distance across all blocks: {mean_frob:.4f}")
-    if run is not None:
+    # ── Panel C: Head diversity ───────────────────────────────────────
+    print("\nPanel C — Head diversity...")
+    for l in blocks_show:
+        fig = plot_head_diversity(l, teacher_attn[l], student_trans[l], bidx)
+        path = os.path.join(args.out_dir, f"panelC_block{l:02d}_head_diversity.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {path}")
+        if run:
+            import wandb; run.log({f"C_heads/block_{l:02d}": wandb.Image(path)})
+
+    # ── Panel D: Summary + Frobenius bar ─────────────────────────────
+    print("\nPanel D — Summary comparison...")
+    fig = plot_summary_comparison(
+        teacher_attn, student_trans, frob_per_block, blocks_show, bidx,
+    )
+    path = os.path.join(args.out_dir, "panelD_summary_frobenius.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+    if run:
+        import wandb; run.log({"D_summary": wandb.Image(path)})
+
+    # ── Summary ───────────────────────────────────────────────────────
+    mean_frob = sum(frob_per_block) / max(len(frob_per_block), 1)
+    print(f"\nMean Frobenius distance: {mean_frob:.4f}")
+    if run:
         run.log({"frobenius/mean": mean_frob})
         run.finish()
 

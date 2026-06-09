@@ -61,7 +61,7 @@ D_CONV     = 3
 CHUNK_SIZE = 16
 
 # ── Stage 1 ───────────────────────────────────────────────────────────
-S1_EPOCHS  = 10
+S1_EPOCHS  = 20
 S1_LR      = 1e-3
 LOG_FREQ   = 10
 VIZ_FREQ   = 2

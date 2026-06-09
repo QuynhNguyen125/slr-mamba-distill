@@ -124,12 +124,12 @@ def _materialize_transfer_matrix(
     if not T.is_contiguous():
         T = T.contiguous()
 
-    # D skip connection on diagonal (added once)
+    # D skip connection on diagonal (added once, vectorized)
+    # T.diagonal(dim1=-2, dim2=-1) → view (B, H, L) — không copy memory
+    # D.view(1, H, 1) broadcast qua B và L
     if D is not None:
         assert D.shape[0] == H, f"D shape mismatch: {D.shape[0]} vs {H}"
-        # Use safe diagonal addition to avoid fancy indexing issues
-        for i in range(L):
-            T[:, :, i, i] = T[:, :, i, i] + D
+        T.diagonal(dim1=-2, dim2=-1).add_(D.view(1, H, 1))
 
     return T
 
@@ -238,8 +238,9 @@ class BiMamba2Mixer(nn.Module):
         )
 
         # ── D skip connection (per v_head) ────────────────────────────
-        self.D = nn.Parameter(torch.ones(n_heads))
-        self.D._optim = {"weight_decay": 0.0}
+        # Khởi tạo ngẫu nhiên trong [0, 1] → học bởi AdamW trong quá trình training.
+        # Không dùng ones() vì tất cả head bắt đầu giống nhau → mất symmetry-breaking.
+        self.D = nn.Parameter(torch.empty(n_heads).uniform_(0.0, 1.0))
 
         # ── z bias (from phi-mamba) ───────────────────────────────────
         self.z_bias = nn.Parameter(torch.zeros(self.d_inner)) if not bias else 0
