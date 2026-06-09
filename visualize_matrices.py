@@ -485,58 +485,70 @@ def main():
     blocks_show = [b for b in args.blocks if b < len(frob_per_block)]
     bidx        = min(args.sample_idx, x.shape[0] - 1)
 
-    # ── Generate all panels — save PNG, collect wandb dict ───────────
-    wandb_log = {}
+    # ── Generate all panels ───────────────────────────────────────────
+    # Dùng commit=False cho mỗi log → tích lũy cùng 1 step trên wandb
+    # Dùng try/except cho mỗi panel → panel lỗi không làm crash toàn bộ
+
+    def _log(key, path):
+        """Log 1 image lên wandb với commit=False (chưa flush)."""
+        if run:
+            import wandb
+            run.log({key: wandb.Image(path)}, commit=False)
 
     # Panel A: CLS attention row
     print("\nPanel A — CLS attention row...")
     for l in blocks_show:
-        fig  = plot_cls_attention(l, teacher_attn[l], student_trans[l], bidx)
-        path = os.path.join(args.out_dir, f"panelA_block{l:02d}_cls_attention.png")
-        fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
-        print(f"  Saved: {path}")
-        if run:
-            import wandb; wandb_log[f"A_cls/block_{l:02d}"] = wandb.Image(path)
+        try:
+            fig  = plot_cls_attention(l, teacher_attn[l], student_trans[l], bidx)
+            path = os.path.join(args.out_dir, f"panelA_block{l:02d}_cls_attention.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
+            print(f"  Saved: {path}")
+            _log(f"A_cls/block_{l:02d}", path)
+        except Exception as e:
+            print(f"  [ERROR] Panel A block {l}: {e}")
 
     # Panel B: Joint group attention
     print("\nPanel B — Joint group attention...")
     for l in blocks_show:
-        fig  = plot_joint_group_attention(l, teacher_attn[l], student_trans[l], bidx)
-        path = os.path.join(args.out_dir, f"panelB_block{l:02d}_joint_groups.png")
-        fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
-        print(f"  Saved: {path}")
-        if run:
-            import wandb; wandb_log[f"B_groups/block_{l:02d}"] = wandb.Image(path)
+        try:
+            fig  = plot_joint_group_attention(l, teacher_attn[l], student_trans[l], bidx)
+            path = os.path.join(args.out_dir, f"panelB_block{l:02d}_joint_groups.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
+            print(f"  Saved: {path}")
+            _log(f"B_groups/block_{l:02d}", path)
+        except Exception as e:
+            print(f"  [ERROR] Panel B block {l}: {e}")
 
     # Panel C: Head diversity
     print("\nPanel C — Head diversity...")
     for l in blocks_show:
-        fig  = plot_head_diversity(l, teacher_attn[l], student_trans[l], bidx)
-        path = os.path.join(args.out_dir, f"panelC_block{l:02d}_head_diversity.png")
-        fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
-        print(f"  Saved: {path}")
-        if run:
-            import wandb; wandb_log[f"C_heads/block_{l:02d}"] = wandb.Image(path)
+        try:
+            fig  = plot_head_diversity(l, teacher_attn[l], student_trans[l], bidx)
+            path = os.path.join(args.out_dir, f"panelC_block{l:02d}_head_diversity.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
+            print(f"  Saved: {path}")
+            _log(f"C_heads/block_{l:02d}", path)
+        except Exception as e:
+            print(f"  [ERROR] Panel C block {l}: {e}")
 
     # Panel D: Summary + Frobenius bar
     print("\nPanel D — Summary comparison...")
-    fig  = plot_summary_comparison(
-        teacher_attn, student_trans, frob_per_block, blocks_show, bidx,
-    )
-    path = os.path.join(args.out_dir, "panelD_summary_frobenius.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
-    print(f"  Saved: {path}")
-    if run:
-        import wandb; wandb_log["D_summary"] = wandb.Image(path)
+    try:
+        fig  = plot_summary_comparison(
+            teacher_attn, student_trans, frob_per_block, blocks_show, bidx,
+        )
+        path = os.path.join(args.out_dir, "panelD_summary_frobenius.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
+        print(f"  Saved: {path}")
+        _log("D_summary", path)
+    except Exception as e:
+        print(f"  [ERROR] Panel D: {e}")
 
-    # ── Log tất cả panels trong 1 lần → cùng step trên wandb ─────────
-    if run and wandb_log:
-        run.log(wandb_log)
-
-    # ── Summary ───────────────────────────────────────────────────────
+    # ── Commit tất cả images cùng 1 step + flush ─────────────────────
     mean_frob = sum(frob_per_block) / max(len(frob_per_block), 1)
     print(f"\nMean Frobenius distance: {mean_frob:.4f}")
     if run:
+        # commit=True (default) → flush toàn bộ buffer commit=False ở trên
         run.log({"frobenius/mean": mean_frob})
         run.finish()
 
