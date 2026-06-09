@@ -119,7 +119,7 @@ class TeacherModel(nn.Module):
             use_bias=use_bias,
         )
 
-        ckpt = torch.load(checkpoint_path, map_location=device)
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         state = _load_lightning_state_dict(ckpt)
         self.model.load_state_dict(state, strict=True)
 

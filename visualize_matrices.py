@@ -74,12 +74,10 @@ GROUP_COLORS = {"body": "Blues", "left_hand": "Greens", "right_hand": "Oranges"}
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--student_ckpt",  required=True)
-    p.add_argument("--teacher_ckpt",  default=os.path.join(
-        _HERE, "..",
-        "skeleton-slr-transformer-main (1)",
-        "skeleton-slr-transformer-main", "scripts", "outputs",
-        "2026-06-04", "16-23-19", "checkpoints",
-        "epoch=1400-valid_loss=1.1588-valid_accuracy_PI@01=0.8254.ckpt",
+    p.add_argument("--teacher_ckpt",  default=os.path.expanduser(
+        "~/sign-language-recognition/skeleton-slr-transformer-main"
+        "/scripts/outputs/2026-06-04/16-23-19/checkpoints"
+        "/epoch=1400-valid_loss=1.1588-valid_accuracy_PI@01=0.8254.ckpt"
     ))
     p.add_argument("--split_file",    required=True)
     p.add_argument("--pose_root",     required=True)
@@ -151,6 +149,14 @@ def _np(t: torch.Tensor) -> np.ndarray:
     return t.float().numpy()
 
 
+def _norm01(mat: np.ndarray) -> np.ndarray:
+    """Normalize matrix về [0, 1] theo min-max. Trả về bản copy, không thay đổi gốc."""
+    lo, hi = mat.min(), mat.max()
+    if hi - lo < 1e-8:          # matrix phẳng (tất cả giá trị bằng nhau)
+        return np.zeros_like(mat)
+    return (mat - lo) / (hi - lo)
+
+
 def _avg_joints(mat: torch.Tensor, joint_indices) -> torch.Tensor:
     """Average (BM, V, H, L, L) over selected joint indices → (BM, H, L, L)."""
     return mat[:, joint_indices, :, :, :].mean(dim=1)
@@ -199,20 +205,22 @@ def plot_cls_attention(block_idx, teacher_tm, student_tm, sample_idx):
     )
 
     for h in range(H):
-        t_row = t_cls[h]   # (T,)
-        s_row = s_cls[h]   # (T,)
+        # Normalize mỗi row về [0,1] riêng — so sánh shape phân phối, không bị lệch scale
+        t_row = _norm01(t_cls[h])   # (T,)
+        s_row = _norm01(s_cls[h])   # (T,)
         frames = np.arange(T)
 
         for col, (row, label, color) in enumerate([
-            (t_row, f"Teacher — head {h}", "steelblue"),
-            (s_row, f"Student — head {h}", "tomato"),
+            (t_row, f"Teacher — head {h}  [norm 0-1]", "steelblue"),
+            (s_row, f"Student — head {h}  [norm 0-1]", "tomato"),
         ]):
             ax = axes[h][col]
             ax.bar(frames, row, color=color, alpha=0.8, width=0.9)
             ax.set_xlim(-0.5, T - 0.5)
+            ax.set_ylim(0, 1.05)
             ax.set_title(label, fontsize=8)
             ax.set_xlabel("Frame index", fontsize=7)
-            ax.set_ylabel("Weight", fontsize=7)
+            ax.set_ylabel("Normalized weight", fontsize=7)
             ax.tick_params(labelsize=6)
 
     plt.tight_layout()
@@ -245,19 +253,21 @@ def plot_joint_group_attention(block_idx, teacher_tm, student_tm, sample_idx):
 
     for row, (grp_name, grp_idx) in enumerate(groups):
         # (H, L, L) → average over H → (L, L)
-        t_mat = _np(_avg_joints(teacher_tm, grp_idx)[b].mean(dim=0))
-        s_mat = _np(_avg_joints(student_tm, grp_idx)[b].mean(dim=0))
-        d_mat = s_mat - t_mat
+        t_mat_raw = _np(_avg_joints(teacher_tm, grp_idx)[b].mean(dim=0))
+        s_mat_raw = _np(_avg_joints(student_tm, grp_idx)[b].mean(dim=0))
 
-        vmin_ts = min(t_mat.min(), s_mat.min())
-        vmax_ts = max(t_mat.max(), s_mat.max())
-        abs_d   = max(np.abs(d_mat).max(), 1e-8)
-        cmap    = GROUP_COLORS[grp_name]
+        # Normalize riêng từng matrix về [0,1] để so sánh pattern hình học
+        t_mat = _norm01(t_mat_raw)
+        s_mat = _norm01(s_mat_raw)
+        # Diff tính trên bản đã normalize → sai lệch pattern, không phải scale
+        d_mat = s_mat - t_mat
+        abs_d = max(np.abs(d_mat).max(), 1e-8)
+        cmap  = GROUP_COLORS[grp_name]
 
         for col, (mat, title, cm, vlo, vhi) in enumerate([
-            (t_mat, f"Teacher — {grp_name}",  cmap,    vmin_ts, vmax_ts),
-            (s_mat, f"Student — {grp_name}",  cmap,    vmin_ts, vmax_ts),
-            (d_mat, f"Diff  — {grp_name}",    "RdBu_r", -abs_d,  abs_d),
+            (t_mat, f"Teacher — {grp_name}  [0-1]",  cmap,    0, 1),
+            (s_mat, f"Student — {grp_name}  [0-1]",  cmap,    0, 1),
+            (d_mat, f"Diff  — {grp_name}",            "RdBu_r", -abs_d, abs_d),
         ]):
             ax  = axes[row][col]
             im  = _imshow(ax, mat, cm, vlo, vhi, title)
@@ -294,13 +304,13 @@ def plot_head_diversity(block_idx, teacher_tm, student_tm, sample_idx):
     )
 
     for h in range(H):
-        t_mat = t_all[h]
-        s_mat = s_all[h]
-        vmin  = min(t_mat.min(), s_mat.min())
-        vmax  = max(t_mat.max(), s_mat.max())
+        # Normalize riêng từng matrix để mỗi head hiển thị đầy đủ range màu
+        # → dễ thấy pattern local/global của từng head dù magnitude khác nhau
+        t_mat = _norm01(t_all[h])
+        s_mat = _norm01(s_all[h])
 
-        im_t = _imshow(axes[0][h], t_mat, "Blues", vmin, vmax, f"Teacher h{h}")
-        im_s = _imshow(axes[1][h], s_mat, "Reds",  vmin, vmax, f"Student h{h}")
+        im_t = _imshow(axes[0][h], t_mat, "Blues", 0, 1, f"Teacher h{h}\n[norm 0-1]")
+        im_s = _imshow(axes[1][h], s_mat, "Reds",  0, 1, f"Student h{h}\n[norm 0-1]")
         _colorbar(fig, axes[0][h], im_t)
         _colorbar(fig, axes[1][h], im_s)
 
@@ -338,19 +348,20 @@ def plot_summary_comparison(teacher_attn_all, student_trans_all, frob_per_block,
         b = min(sample_idx, BM - 1)
 
         # Average over V joints and H heads → (L, L)
-        t_mat = _np(teacher_attn_all[l][b].mean(dim=(0, 1)))   # (L, L)
-        s_mat = _np(student_trans_all[l][b].mean(dim=(0, 1)))   # (L, L)
-        d_mat = s_mat - t_mat
+        t_mat_raw = _np(teacher_attn_all[l][b].mean(dim=(0, 1)))
+        s_mat_raw = _np(student_trans_all[l][b].mean(dim=(0, 1)))
 
-        vmin_ts = min(t_mat.min(), s_mat.min())
-        vmax_ts = max(t_mat.max(), s_mat.max())
-        abs_d   = max(np.abs(d_mat).max(), 1e-8)
-        frob    = frob_per_block[l] if l < len(frob_per_block) else 0.0
+        # Normalize riêng về [0,1] → so sánh pattern, không bị lệch scale
+        t_mat = _norm01(t_mat_raw)
+        s_mat = _norm01(s_mat_raw)
+        d_mat = s_mat - t_mat
+        abs_d = max(np.abs(d_mat).max(), 1e-8)
+        frob  = frob_per_block[l] if l < len(frob_per_block) else 0.0
 
         for col, (mat, title, cm, vlo, vhi) in enumerate([
-            (t_mat, f"Teacher  block {l}",  "Blues",  vmin_ts, vmax_ts),
-            (s_mat, f"Student  block {l}",  "Blues",  vmin_ts, vmax_ts),
-            (d_mat, f"Diff  (Frob={frob:.3f})", "RdBu_r", -abs_d,  abs_d),
+            (t_mat, f"Teacher  block {l}  [0-1]",       "Blues",  0, 1),
+            (s_mat, f"Student  block {l}  [0-1]",       "Blues",  0, 1),
+            (d_mat, f"Diff  (Frob={frob:.3f})",         "RdBu_r", -abs_d, abs_d),
         ]):
             ax = fig.add_subplot(gs[row, col])
             im = _imshow(ax, mat, cm, vlo, vhi, title)
