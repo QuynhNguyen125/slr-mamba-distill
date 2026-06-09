@@ -19,6 +19,8 @@ Cách dùng:
 import os, sys, warnings, logging
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# Giảm memory fragmentation — quan trọng khi dùng PyTorch SSM fallback
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import compat  # inject torchvision stub
 
@@ -54,7 +56,7 @@ OUTPUT_DIR = "checkpoints"
 SEQ_LEN     = 50
 N_JOINTS    = 55
 IN_CHANNELS = 2
-BATCH_SIZE  = 8
+BATCH_SIZE  = 4    # giảm từ 8 → 4: stage2 backward-per-block cần nhiều memory hơn stage1
 NUM_WORKERS = 4
 VAL_COPIES  = 4
 

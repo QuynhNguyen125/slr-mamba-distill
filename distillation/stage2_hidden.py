@@ -120,54 +120,61 @@ def train_stage2(
                 "Kiểm tra hook feed_forward_network trong TeacherModel."
             )
 
+            # ── Backward per-block (phi-mamba pattern) ───────────────
+            # Gọi loss.backward() ngay sau mỗi block thay vì accumulate
+            # tất cả n blocks rồi backward một lần.
+            # → chỉ 1 computation graph trong memory tại mỗi thời điểm
+            # → giảm peak memory từ O(n_blocks) xuống O(1)
             optimizer.zero_grad()
-            n    = min(n_blocks, len(block_inputs))
-            loss = torch.tensor(0.0, device=device)
+            n         = min(n_blocks, len(block_inputs))
+            step_loss = 0.0   # chỉ để log, không dùng cho backward
 
             for l in range(n):
                 student_input = block_inputs[l].to(device)
 
                 # ── Target theo phi-mamba ─────────────────────────────
-                # freeze_mlp=True  → all_attn_outputs = pre_ffn_states
-                # freeze_mlp=False → all_hidden_states[l+1] = block_outputs
                 if freeze_mlp:
-                    teacher_target = pre_ffn_states[l].to(device)   # (BM, T+1, V, D)
+                    teacher_target = pre_ffn_states[l].to(device)
                 else:
-                    teacher_target = block_outputs[l].to(device)    # (BM, T+1, V, D)
+                    teacher_target = block_outputs[l].to(device)
 
                 s_out = student.blocks[l](
                     hidden_states=student_input,
-                    run_mlp_component=not freeze_mlp,   # khớp với phi-mamba
+                    run_mlp_component=not freeze_mlp,
                     return_transfer_matrix=False,
                 )
-                student_output = s_out["hidden_states"]  # (BM, T+1, V, D)
+                student_output = s_out["hidden_states"]
 
-                assert student_output.shape == teacher_target.shape, (
-                    f"[Stage2] Shape mismatch block {l}: "
-                    f"student={student_output.shape} teacher={teacher_target.shape}"
-                )
+                # Chia n để gradient scale nhất quán với loss trung bình
+                block_loss = hidden_state_l2_loss(student_output, teacher_target) / n
 
-                block_loss = hidden_state_l2_loss(student_output, teacher_target)
-                loss = loss + block_loss
-                mse_per_block[l] += block_loss.item()
+                # Backward ngay — giải phóng graph của block l trước block l+1
+                block_loss.backward()
 
-            loss = loss / n
-            loss.backward()
+                block_val = block_loss.item()
+                step_loss += block_val
+                mse_per_block[l] += block_val
+
+                # Giải phóng fragment memory giữa các blocks
+                del s_out, student_output, teacher_target, block_loss
+                if device != "cpu":
+                    torch.cuda.empty_cache()
+
             torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
             optimizer.step()
 
-            epoch_loss  += loss.item()
+            epoch_loss  += step_loss
             global_step += 1
 
             if (step + 1) % log_freq == 0:
                 print(
                     f"[Stage2/{mode}] Epoch {epoch+1}/{num_epochs}  "
                     f"Step {step+1}/{len(dataloader)}  "
-                    f"Loss: {loss.item():.4f}"
+                    f"Loss: {step_loss:.4f}"
                 )
                 if wandb_run is not None:
                     wandb_run.log({
-                        "stage2/loss_step": loss.item(),
+                        "stage2/loss_step": step_loss,
                         "stage2/lr":        optimizer.param_groups[0]["lr"],
                     }, step=global_step)
 
