@@ -14,8 +14,9 @@ Student block (HybridB2TPostNormBlock):
   temporal Bi-Mamba2 [NEW]    → residual → norm2
   FFN + residual + input      [UNCHANGED] → norm3  (B2T preserved)
 
-Everything else (input format, embedding, cls_token, spatial PE, pooling,
-classifier, norm_type=batchnorm) is identical to the teacher.
+Everything else (input format, embedding, cls_token, pooling, classifier,
+norm_type=batchnorm) is identical to the teacher. Note: student does NOT use
+positional encoding (removed to focus on temporal SSM learning).
 
 Input: (B, C=2, T, V=55, M=1)  — same as SpatialTemporalTransformerWithClassToken
 
@@ -45,7 +46,6 @@ from sstan.models.transformers.modules.attention import MultiHeadSelfAttention
 from sstan.models.transformers.postnorm_transformer import FeedForwardNetwork
 
 from .mixers.bi_mamba2 import BiMamba2Mixer
-from .pos_encode import SinusoidalPositionalEncoding
 
 
 class StochasticDepth(nn.Module):
@@ -258,10 +258,6 @@ class BiMambaSLR(nn.Module):
         # ── Class token (same as teacher) ────────────────────────────
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
 
-        # ── Spatial PE (same as teacher) ─────────────────────────────
-        self.spatial_positional_encode = SinusoidalPositionalEncoding(
-            embedding_dim, n_joints
-        )
 
         # ── Blocks (same count + stochastic depth schedule) ──────────
         stoch_rates = np.linspace(0.0, max_stochastic_depth_rate, n_blocks)
@@ -406,8 +402,6 @@ class BiMambaSLR(nn.Module):
 
         cls = self.cls_token.expand(B * M, 1, V, -1)
         x = torch.cat([cls, x], dim=1)                # (BM, T+1, V, D)
-
-        x = self.spatial_positional_encode(x)
 
         temporal_tms, all_hidden = [], []
 
