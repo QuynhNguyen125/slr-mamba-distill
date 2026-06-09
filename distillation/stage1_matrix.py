@@ -178,15 +178,49 @@ def train_stage1(
 
 @torch.no_grad()
 def _compute_val_loss(student, teacher, val_loader, device, n_blocks):
-    """Tính Frobenius loss trên validation set."""
+    """
+    Tính Frobenius loss trên validation set.
+
+    Hỗ trợ hai kiểu multi-crop từ Sign_Dataset:
+
+    Kiểu A — flat k_copies (Sign_Dataset mặc định):
+        shape: (B, C, T*n_copies, V, M)   — 5D
+        Sign_Dataset nối tất cả copies dọc theo trục thời gian.
+        → split T*n_copies thành n_copies clip riêng biệt T frames.
+
+    Kiểu B — stacked n_copies (legacy):
+        shape: (B, n_copies, C, T, V, M)  — 6D
+        → flatten B và n_copies.
+    """
     student.eval()
     total = 0.0
     count = 0
+
+    # seq_len gốc (không tính cls token) — dùng để detect flat k_copies
+    seq_len = student.seq_len - 1   # student lưu seq_len+1
+
     for batch in val_loader:
         x = _get_x(batch, device)
+
+        # ── Kiểu A: flat k_copies → (B, C, T*n, V, M) ────────────────
+        if x.ndim == 5:
+            B, C, T_total, V, M_dim = x.shape
+            if T_total > seq_len and T_total % seq_len == 0:
+                n_copies = T_total // seq_len
+                # (B, C, n_copies, seq_len, V, M) → (B*n_copies, C, seq_len, V, M)
+                x = (x.view(B, C, n_copies, seq_len, V, M_dim)
+                      .permute(0, 2, 1, 3, 4, 5)
+                      .contiguous()
+                      .view(B * n_copies, C, seq_len, V, M_dim))
+
+        # ── Kiểu B: stacked n_copies → (B, n_copies, C, T, V, M) ─────
+        elif x.ndim == 6:
+            B, n_copies, C, T, V, M_dim = x.shape
+            x = x.contiguous().view(B * n_copies, C, T, V, M_dim)
+
         t_out = teacher(x, return_attn=True, return_hidden_states=True)
-        tm_teacher_all    = t_out["temporal_attn_matrices"]
-        teacher_hidden    = t_out["hidden_states"]
+        tm_teacher_all = t_out["temporal_attn_matrices"]
+        teacher_hidden = t_out["hidden_states"]
 
         n = min(n_blocks, len(tm_teacher_all))
         for l in range(n):

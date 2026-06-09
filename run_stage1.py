@@ -145,8 +145,8 @@ def main():
             pose_root=POSE_ROOT,
             split="val",
             num_samples=SEQ_LEN,
-            num_copies=VAL_COPIES,     # ← 4 overlapping clips, match teacher kcopies
-            sample_strategy="sequential",
+            num_copies=VAL_COPIES,     # 4 overlapping clips, match teacher kcopies
+            sample_strategy="k_copies",  # fix: "sequential" → "k_copies"
             skeleton_augmentation=False,
         )
         _collate    = partial(collate_fn, num_classes=num_classes)
