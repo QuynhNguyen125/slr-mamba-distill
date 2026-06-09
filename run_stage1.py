@@ -61,10 +61,11 @@ D_CONV     = 3
 CHUNK_SIZE = 16
 
 # ── Stage 1 ───────────────────────────────────────────────────────────
-S1_EPOCHS = 10
-S1_LR     = 1e-3
-LOG_FREQ  = 10
-VIZ_FREQ  = 2
+S1_EPOCHS  = 10
+S1_LR      = 1e-3
+LOG_FREQ   = 10
+VIZ_FREQ   = 2
+VAL_COPIES = 4   # multi-crop validation — match teacher's kcopies=4
 
 # ── Wandb ─────────────────────────────────────────────────────────────
 USE_WANDB     = True
@@ -144,8 +145,8 @@ def main():
             pose_root=POSE_ROOT,
             split="val",
             num_samples=SEQ_LEN,
-            num_copies=1,  # ← Single crop (no multi-crop augmentation for val)
-            sample_strategy="sequential",  # ← Use sequential sampling
+            num_copies=VAL_COPIES,     # ← 4 overlapping clips, match teacher kcopies
+            sample_strategy="sequential",
             skeleton_augmentation=False,
         )
         _collate    = partial(collate_fn, num_classes=num_classes)
