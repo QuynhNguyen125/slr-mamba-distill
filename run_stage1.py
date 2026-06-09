@@ -155,8 +155,8 @@ def main():
             pose_root=POSE_ROOT,
             split="val",
             num_samples=SEQ_LEN,
-            num_copies=4,
-            sample_strategy="k_copies",
+            num_copies=1,  # ← Single crop (no multi-crop augmentation for val)
+            sample_strategy="sequential",  # ← Use sequential sampling
             skeleton_augmentation=False,
         )
         _collate    = partial(collate_fn, num_classes=num_classes)
