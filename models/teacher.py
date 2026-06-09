@@ -129,6 +129,9 @@ class TeacherModel(nn.Module):
         self._temporal_attn:  List[torch.Tensor] = []
         self._block_inputs:   List[torch.Tensor] = []  # INPUT  to block l  (pre-hook)
         self._block_outputs:  List[torch.Tensor] = []  # OUTPUT of block l  (post-hook)
+        self._pre_ffn_states: List[torch.Tensor] = []  # state BEFORE FFN  (phi-mamba: all_attn_outputs)
+        #   = output sau temporal attention + norm2 + transpose back
+        #   = TARGET cho student khi freeze_mlp=True trong Stage 2
         self._hooks: List = []
         self._register_hooks()
 
@@ -188,10 +191,26 @@ class TeacherModel(nn.Module):
                     self._temporal_attn.append(attn.detach())
                 return hook
 
+            # ── Pre-hook trên FFN: capture state TRƯỚC FFN ─────────────
+            # Đây là mapping với phi-mamba's all_attn_outputs[layer_idx].
+            # x tại đây = output sau temporal attention + norm2 + transpose
+            #           = (BM, T+1, V, D)
+            # Dùng làm TARGET khi freeze_mlp=True trong Stage 2:
+            #   student chạy spatial MHA + temporal Mamba (no FFN)
+            #   → match với teacher's pre-FFN state
+            def make_pre_ffn_hook():
+                def hook(mod, inp):
+                    tensor_in = inp[0] if isinstance(inp, tuple) else inp
+                    if not isinstance(tensor_in, torch.Tensor):
+                        return
+                    self._pre_ffn_states.append(tensor_in.detach())
+                return hook
+
             h1 = block.register_forward_pre_hook(make_pre_hook())
             h2 = block.register_forward_hook(make_post_hook())
             h3 = block.multihead_self_attention2.register_forward_hook(make_tm_hook())
-            self._hooks.extend([h1, h2, h3])
+            h4 = block.feed_forward_network.register_forward_pre_hook(make_pre_ffn_hook())
+            self._hooks.extend([h1, h2, h3, h4])
 
     def remove_hooks(self):
         for h in self._hooks:
@@ -211,6 +230,7 @@ class TeacherModel(nn.Module):
         self._temporal_attn.clear()
         self._block_inputs.clear()
         self._block_outputs.clear()
+        self._pre_ffn_states.clear()
 
         with torch.no_grad():
             logits = self.model(skeleton_data)
@@ -220,8 +240,10 @@ class TeacherModel(nn.Module):
             # list[n_blocks] of (BM, V, H, T+1, T+1)
             result["temporal_attn_matrices"] = list(self._temporal_attn)
         if return_hidden_states:
-            # hidden_states[l]  = INPUT  to teacher block l   → student_input  for block l
-            # block_outputs[l]  = OUTPUT of teacher block l   → target for student block l
+            # hidden_states[l]   = INPUT  to teacher block l        → student_input for block l
+            # pre_ffn_states[l]  = state BEFORE FFN of teacher block l → target khi freeze_mlp=True
+            # block_outputs[l]   = OUTPUT of teacher block l (full)  → target khi freeze_mlp=False
             result["hidden_states"]  = list(self._block_inputs)
+            result["pre_ffn_states"] = list(self._pre_ffn_states)
             result["block_outputs"]  = list(self._block_outputs)
         return result

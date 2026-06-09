@@ -29,12 +29,20 @@ def hidden_state_l2_loss(
     teacher_hidden: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Mean L2 loss between student and teacher hidden states.
+    Per-token L2 norm giữa student và teacher hidden states.
 
-    Both tensors: (B, L, d)
-    Returns scalar loss.
+    Theo phi-mamba mohawk_stage2.py dòng 79-81:
+        loss = torch.norm(student - teacher, p=2, dim=(-1,)).mean()
+
+    Với shape (BM, T+1, V, D):
+        - Tính ||h_s[b,t,v,:] - h_t[b,t,v,:]||_2  per (b, t, v) tuple
+        - mean() qua tất cả (b, t, v)
+
+    Khác với F.mse_loss (mean of squared elements):
+        L2 norm per token đo khoảng cách Euclidean giữa các representation
+        vectors, nhạy hơn với lệch hướng trong feature space.
     """
-    return F.mse_loss(student_hidden, teacher_hidden)
+    return torch.norm(student_hidden - teacher_hidden, p=2, dim=-1).mean()
 
 
 def kl_distillation_loss(
