@@ -485,50 +485,53 @@ def main():
     blocks_show = [b for b in args.blocks if b < len(frob_per_block)]
     bidx        = min(args.sample_idx, x.shape[0] - 1)
 
-    # ── Panel A: CLS attention row ────────────────────────────────────
+    # ── Generate all panels — save PNG, collect wandb dict ───────────
+    wandb_log = {}
+
+    # Panel A: CLS attention row
     print("\nPanel A — CLS attention row...")
     for l in blocks_show:
-        fig = plot_cls_attention(l, teacher_attn[l], student_trans[l], bidx)
+        fig  = plot_cls_attention(l, teacher_attn[l], student_trans[l], bidx)
         path = os.path.join(args.out_dir, f"panelA_block{l:02d}_cls_attention.png")
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
+        fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
         print(f"  Saved: {path}")
         if run:
-            import wandb; run.log({f"A_cls/block_{l:02d}": wandb.Image(path)})
+            import wandb; wandb_log[f"A_cls/block_{l:02d}"] = wandb.Image(path)
 
-    # ── Panel B: Joint group attention ───────────────────────────────
+    # Panel B: Joint group attention
     print("\nPanel B — Joint group attention...")
     for l in blocks_show:
-        fig = plot_joint_group_attention(l, teacher_attn[l], student_trans[l], bidx)
+        fig  = plot_joint_group_attention(l, teacher_attn[l], student_trans[l], bidx)
         path = os.path.join(args.out_dir, f"panelB_block{l:02d}_joint_groups.png")
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
+        fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
         print(f"  Saved: {path}")
         if run:
-            import wandb; run.log({f"B_groups/block_{l:02d}": wandb.Image(path)})
+            import wandb; wandb_log[f"B_groups/block_{l:02d}"] = wandb.Image(path)
 
-    # ── Panel C: Head diversity ───────────────────────────────────────
+    # Panel C: Head diversity
     print("\nPanel C — Head diversity...")
     for l in blocks_show:
-        fig = plot_head_diversity(l, teacher_attn[l], student_trans[l], bidx)
+        fig  = plot_head_diversity(l, teacher_attn[l], student_trans[l], bidx)
         path = os.path.join(args.out_dir, f"panelC_block{l:02d}_head_diversity.png")
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
+        fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
         print(f"  Saved: {path}")
         if run:
-            import wandb; run.log({f"C_heads/block_{l:02d}": wandb.Image(path)})
+            import wandb; wandb_log[f"C_heads/block_{l:02d}"] = wandb.Image(path)
 
-    # ── Panel D: Summary + Frobenius bar ─────────────────────────────
+    # Panel D: Summary + Frobenius bar
     print("\nPanel D — Summary comparison...")
-    fig = plot_summary_comparison(
+    fig  = plot_summary_comparison(
         teacher_attn, student_trans, frob_per_block, blocks_show, bidx,
     )
     path = os.path.join(args.out_dir, "panelD_summary_frobenius.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    fig.savefig(path, dpi=150, bbox_inches="tight");  plt.close(fig)
     print(f"  Saved: {path}")
     if run:
-        import wandb; run.log({"D_summary": wandb.Image(path)})
+        import wandb; wandb_log["D_summary"] = wandb.Image(path)
+
+    # ── Log tất cả panels trong 1 lần → cùng step trên wandb ─────────
+    if run and wandb_log:
+        run.log(wandb_log)
 
     # ── Summary ───────────────────────────────────────────────────────
     mean_frob = sum(frob_per_block) / max(len(frob_per_block), 1)
