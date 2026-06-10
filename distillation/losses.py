@@ -62,7 +62,14 @@ def kl_distillation_loss(
 
 
 def classification_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Standard cross-entropy loss."""
+    """
+    Cross-entropy loss.
+    - labels shape (B,) hoặc (B,1): class indices → dùng long()
+    - labels shape (B, C) với C > 1:  soft/one-hot labels → dùng float()
+    """
+    if labels.dim() > 1 and labels.shape[-1] > 1:
+        # One-hot hoặc soft label distribution (dataset trả về float one-hot)
+        return F.cross_entropy(logits, labels.float())
     return F.cross_entropy(logits, labels.long().squeeze(-1))
 
 

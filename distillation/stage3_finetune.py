@@ -41,9 +41,9 @@ def set_stage3_trainable(student: BiMambaSLR):
 
 @torch.no_grad()
 def _compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
-    """Top-1 accuracy."""
+    """Top-1 accuracy. labels có thể là class index (B,) hoặc one-hot (B,C)."""
     preds = logits.argmax(dim=-1)
-    tgts  = labels.long().squeeze(-1)
+    tgts  = labels.argmax(dim=-1) if (labels.dim() > 1 and labels.shape[-1] > 1) else labels.long().squeeze(-1)
     return (preds == tgts).float().mean().item()
 
 
@@ -116,7 +116,7 @@ def train_stage3(
 
             with torch.no_grad():
                 preds = student_logits.detach().argmax(dim=-1)
-                tgts  = labels.long().squeeze(-1)
+                tgts  = labels.argmax(dim=-1) if (labels.dim() > 1 and labels.shape[-1] > 1) else labels.long().squeeze(-1)
                 epoch_correct += (preds == tgts).sum().item()
                 epoch_total   += tgts.size(0)
 
@@ -229,7 +229,7 @@ def _compute_val_metrics(student, teacher, val_loader, device, alpha, temperatur
         loss = alpha * kl + (1 - alpha) * ce
 
         preds   = s_logits.argmax(dim=-1)
-        tgts    = labels.long().squeeze(-1)
+        tgts    = labels.argmax(dim=-1) if (labels.dim() > 1 and labels.shape[-1] > 1) else labels.long().squeeze(-1)
         correct = (preds == tgts).sum().item()
 
         total_loss    += loss.item()
