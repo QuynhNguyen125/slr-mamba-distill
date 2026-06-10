@@ -146,7 +146,7 @@ def train_stage2(
                     wandb_run.log({
                         "stage2/train_loss_step": step_loss,
                         "stage2/lr": optimizer.param_groups[0]["lr"],
-                    }, step=global_step)
+                    })
 
         scheduler.step()
 
@@ -177,7 +177,7 @@ def train_stage2(
                 log_dict["stage2/val_loss_epoch"] = val_loss
             for l, v in enumerate(avg_mse):
                 log_dict[f"stage2/mse_block_{l:02d}"] = v
-            wandb_run.log(log_dict, step=global_step)
+            wandb_run.log(log_dict)
 
         # ── Save best checkpoint (theo val_loss nếu có, else train_loss) ──
         monitor = val_loss if val_loss is not None else avg_train_loss
