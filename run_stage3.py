@@ -54,7 +54,8 @@ OUTPUT_DIR = "checkpoints"
 SEQ_LEN     = 50
 N_JOINTS    = 55
 IN_CHANNELS = 2
-BATCH_SIZE  = 8    # Stage 3 không cần backward-per-block → dùng batch lớn hơn
+BATCH_SIZE  = 2    # Stage 3: teacher+student+full graph → memory cao, dùng GRAD_ACCUM
+GRAD_ACCUM  = 4    # Effective batch = BATCH_SIZE * GRAD_ACCUM = 8
 NUM_WORKERS = 4
 VAL_COPIES  = 4
 
@@ -77,6 +78,7 @@ S3_EPOCHS   = 30
 S3_LR       = 1e-4       # LR nhỏ — fine-tuning toàn mô hình
 ALPHA       = 0.5        # weight KL loss; 1-ALPHA = weight CE
 TEMPERATURE = 4.0        # distillation temperature (Hinton et al.)
+GRAD_ACCUM  = 4          # effective batch = BATCH_SIZE * GRAD_ACCUM = 2 * 4 = 8
 
 LOG_FREQ = 10
 
@@ -125,7 +127,8 @@ def main():
                 n_heads=N_HEADS, d_state=D_STATE, d_conv=D_CONV,
                 epochs=S3_EPOCHS, lr=S3_LR,
                 alpha=ALPHA, temperature=TEMPERATURE,
-                batch_size=BATCH_SIZE,
+                batch_size=BATCH_SIZE, grad_accum=GRAD_ACCUM,
+                effective_batch=BATCH_SIZE * GRAD_ACCUM,
             ),
             settings=wandb.Settings(console="off"),
         )
@@ -265,6 +268,7 @@ def main():
         num_epochs=S3_EPOCHS,
         alpha=ALPHA,
         temperature=TEMPERATURE,
+        grad_accum=GRAD_ACCUM,
         log_freq=LOG_FREQ,
         wandb_run=wandb_run,
         save_path=os.path.join(OUTPUT_DIR, "student_stage3.pth"),

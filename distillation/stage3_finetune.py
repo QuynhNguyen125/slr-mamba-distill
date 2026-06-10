@@ -57,6 +57,7 @@ def train_stage3(
     num_epochs: int = 30,
     alpha: float = 0.5,
     temperature: float = 4.0,
+    grad_accum: int = 4,
     log_freq: int = 10,
     wandb_run=None,
     save_path: str = None,
@@ -65,6 +66,7 @@ def train_stage3(
     Args:
         alpha       : weight cho KL loss  (1-alpha = weight CE)
         temperature : distillation temperature (Hinton et al. recommend T=4)
+        grad_accum  : gradient accumulation steps (effective_batch = batch_size * grad_accum)
     """
     teacher.eval()
     teacher.to(device)
@@ -78,7 +80,7 @@ def train_stage3(
 
     trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     print(f"[Stage3] Trainable params: {trainable:,}  (all)")
-    print(f"[Stage3] alpha={alpha}  temperature={temperature}  lr={lr}")
+    print(f"[Stage3] alpha={alpha}  temperature={temperature}  lr={lr}  grad_accum={grad_accum}")
 
     best_val_acc = 0.0
 
@@ -87,42 +89,49 @@ def train_stage3(
         epoch_loss = epoch_kl = epoch_ce = 0.0
         epoch_correct = epoch_total = 0
 
+        optimizer.zero_grad()
+
         for step, batch in enumerate(dataloader):
             x, labels = _get_x_labels(batch, device)
 
-            # ── Teacher forward (frozen) ──────────────────────────────
+            # ── Teacher forward (frozen, no graph) ───────────────────
             with torch.no_grad():
                 teacher_logits = teacher(x)["logits"]
 
             # ── Student forward (full, end-to-end) ────────────────────
             student_logits = student(x)
 
-            # ── Loss ──────────────────────────────────────────────────
+            # ── Loss (scaled by grad_accum) ───────────────────────────
             kl   = kl_distillation_loss(student_logits, teacher_logits, temperature)
             ce   = classification_loss(student_logits, labels)
-            loss = alpha * kl + (1 - alpha) * ce
+            loss = (alpha * kl + (1 - alpha) * ce) / grad_accum
 
-            optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-            optimizer.step()
 
-            # ── Metrics ───────────────────────────────────────────────
-            epoch_loss += loss.item()
+            # ── Metrics (use unscaled loss for logging) ───────────────
+            unscaled = loss.item() * grad_accum
+            epoch_loss += unscaled
             epoch_kl   += kl.item()
             epoch_ce   += ce.item()
 
             with torch.no_grad():
-                preds = student_logits.argmax(dim=-1)
+                preds = student_logits.detach().argmax(dim=-1)
                 tgts  = labels.long().squeeze(-1)
                 epoch_correct += (preds == tgts).sum().item()
                 epoch_total   += tgts.size(0)
+
+            # ── Optimizer step every grad_accum steps ─────────────────
+            if (step + 1) % grad_accum == 0 or (step + 1) == len(dataloader):
+                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                torch.cuda.empty_cache()
 
             if (step + 1) % log_freq == 0:
                 print(
                     f"[Stage3] Epoch {epoch+1}/{num_epochs}  "
                     f"Step {step+1}/{len(dataloader)}  "
-                    f"loss: {loss.item():.4f}  "
+                    f"loss: {unscaled:.4f}  "
                     f"kl: {kl.item():.4f}  "
                     f"ce: {ce.item():.4f}"
                 )
