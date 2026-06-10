@@ -1,16 +1,14 @@
 """
 Chạy Stage 2: Hidden State Alignment (MOHAWK).
 
-Stage 2 gồm 2 phases:
-  Phase A — freeze_mlp=True  (S2A_EPOCHS epochs):
-      Chỉ train temporal_mamba.
-      Target = teacher's pre-FFN state  (phi-mamba: all_attn_outputs).
-      Buộc student mixer học output giống với teacher attention output.
+Theo paper MOHAWK và phi-mamba repo:
+    - 1 phase duy nhất, freeze_mlp=False (full block alignment)
+    - Target = full block output của teacher (phi-mamba: all_hidden_states[l+1])
+    - Loss = ||h_student[l] - h_teacher[l]||_2  per-token L2 norm
+    - Backward per-block để tiết kiệm memory
 
-  Phase B — freeze_mlp=False (S2B_EPOCHS epochs):
-      Train temporal_mamba + FFN + norm3.
-      Target = teacher's full block output.
-      Fine-tune toàn bộ block để khớp teacher output đầy đủ.
+Tham khảo: phi-mamba/assets/mohawk_stage2.py
+    freeze_mlp = True/False  # "up to training scheme"
 
 Cách dùng:
     python run_stage2.py
@@ -19,7 +17,6 @@ Cách dùng:
 import os, sys, warnings, logging
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-# Giảm memory fragmentation — quan trọng khi dùng PyTorch SSM fallback
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import compat  # inject torchvision stub
@@ -56,7 +53,7 @@ OUTPUT_DIR = "checkpoints"
 SEQ_LEN     = 50
 N_JOINTS    = 55
 IN_CHANNELS = 2
-BATCH_SIZE  = 4    # giảm từ 8 → 4: stage2 backward-per-block cần nhiều memory hơn stage1
+BATCH_SIZE  = 4
 NUM_WORKERS = 4
 VAL_COPIES  = 4
 
@@ -74,13 +71,9 @@ D_STATE    = 64
 D_CONV     = 3
 CHUNK_SIZE = 16
 
-# ── Stage 2A: mixer-only (freeze_mlp=True) ───────────────────────────
-S2A_EPOCHS = 10
-S2A_LR     = 5e-4
-
-# ── Stage 2B: mixer+FFN (freeze_mlp=False) ───────────────────────────
-S2B_EPOCHS = 10
-S2B_LR     = 1e-4    # LR nhỏ hơn Phase A — FFN đã được init từ teacher
+# ── Stage 2: full block alignment (freeze_mlp=False) theo paper ──────
+S2_EPOCHS = 20    # train đến khi val loss hội tụ
+S2_LR     = 5e-4
 
 LOG_FREQ = 10
 
@@ -127,9 +120,9 @@ def main():
                 seq_len=SEQ_LEN, n_joints=N_JOINTS,
                 embedding_dim=EMBEDDING_DIM, n_blocks=N_BLOCKS,
                 n_heads=N_HEADS, d_state=D_STATE, d_conv=D_CONV,
-                s2a_epochs=S2A_EPOCHS, s2a_lr=S2A_LR,
-                s2b_epochs=S2B_EPOCHS, s2b_lr=S2B_LR,
+                epochs=S2_EPOCHS, lr=S2_LR,
                 batch_size=BATCH_SIZE,
+                freeze_mlp=False,
             ),
             settings=wandb.Settings(console="off"),
         )
@@ -238,32 +231,12 @@ def main():
     total = sum(p.numel() for p in student.parameters())
     print(f"Student params : {total:,}  ✓")
 
-    # ── Stage 2A: freeze_mlp=True (mixer-only) ────────────────────────
+    # ── Stage 2: Full block hidden state alignment (theo paper) ───────
     print("\n" + "="*60)
-    print("=== Stage 2A: Hidden Alignment — mixer-only (freeze_mlp=True) ===")
-    print("="*60)
-    print("Target = teacher pre-FFN state  (phi-mamba: all_attn_outputs)")
-
-    student = train_stage2(
-        student=student,
-        teacher=teacher,
-        dataloader=train_loader,
-        val_dataloader=val_loader,
-        device=DEVICE,
-        lr=S2A_LR,
-        num_epochs=S2A_EPOCHS,
-        freeze_mlp=True,
-        log_freq=LOG_FREQ,
-        wandb_run=wandb_run,
-        save_path=os.path.join(OUTPUT_DIR, "student_stage2a.pth"),
-    )
-    print(f"\n✓ Stage 2A xong → {OUTPUT_DIR}/student_stage2a.pth")
-
-    # ── Stage 2B: freeze_mlp=False (mixer+FFN) ────────────────────────
-    print("\n" + "="*60)
-    print("=== Stage 2B: Hidden Alignment — mixer+FFN (freeze_mlp=False) ===")
+    print("=== Stage 2: Hidden State Alignment (freeze_mlp=False) ===")
     print("="*60)
     print("Target = teacher full block output  (phi-mamba: all_hidden_states[l+1])")
+    print(f"Epochs : {S2_EPOCHS}  |  LR : {S2_LR}")
 
     student = train_stage2(
         student=student,
@@ -271,14 +244,14 @@ def main():
         dataloader=train_loader,
         val_dataloader=val_loader,
         device=DEVICE,
-        lr=S2B_LR,
-        num_epochs=S2B_EPOCHS,
+        lr=S2_LR,
+        num_epochs=S2_EPOCHS,
         freeze_mlp=False,
         log_freq=LOG_FREQ,
         wandb_run=wandb_run,
         save_path=os.path.join(OUTPUT_DIR, "student_stage2.pth"),
     )
-    print(f"\n✓ Stage 2B xong → {OUTPUT_DIR}/student_stage2.pth")
+    print(f"\n✓ Stage 2 xong → {OUTPUT_DIR}/student_stage2.pth")
 
     if wandb_run is not None:
         wandb_run.finish()

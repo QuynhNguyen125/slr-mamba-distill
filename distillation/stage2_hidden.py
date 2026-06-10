@@ -1,31 +1,26 @@
 """
-Stage 2 — Hidden State Alignment (MOHAWK, block-wise).
+Stage 2 — Hidden State Alignment (MOHAWK).
 
-Theo phi-mamba Stage 2 skeleton:
+Theo paper MOHAWK và phi-mamba/assets/mohawk_stage2.py:
 
-    freeze_mlp=True  (Phase A — mixer-only):
-        student_input  = teacher.hidden_states[l]      ← input của block l
-        student_output = student.blocks[l](input, run_mlp=False)
-                       = output SAU spatial MHA + temporal Mamba, TRƯỚC FFN
-        teacher_target = teacher.pre_ffn_states[l]     ← phi-mamba: all_attn_outputs[l]
-                       = output SAU temporal attention + norm2 + transpose, TRƯỚC FFN
-        loss = MSE(student_output, teacher_target)
+    Với mỗi block l:
+        student_input  = teacher.hidden_states[l]         ← input đến block l
+        student_output = student.blocks[l](student_input) ← full block (spatial+temporal+FFN)
+        teacher_target = teacher.block_outputs[l]         ← full block output
+        loss = ||student_output - teacher_target||_2      ← per-token L2 norm
 
-    freeze_mlp=False (Phase B — mixer+FFN):
-        student_output = student.blocks[l](input, run_mlp=True)
-                       = full block output (spatial + temporal + FFN + B2T)
-        teacher_target = teacher.block_outputs[l]      ← full block output
-        loss = MSE(student_output, teacher_target)
+    freeze_mlp=False: tất cả parameter của block được train
+    (temporal_mamba + feed_forward_network + norm layers)
 
-Mapping với phi-mamba:
-    teacher.pre_ffn_states  ↔  teacher_outputs.all_attn_outputs
-    teacher.block_outputs   ↔  teacher_outputs.all_hidden_states[l+1]
-    run_mlp_component       ↔  not freeze_mlp (đồng nhất với phi-mamba)
+Backward per-block (phi-mamba pattern) để tiết kiệm memory:
+    → backward() ngay sau mỗi block, chỉ giữ 1 computation graph tại 1 thời điểm
 
 Logs to wandb:
-  stage2/loss_step, stage2/loss_epoch, stage2/lr
-  stage2/mse_block_{l:02d}
-  stage2/phase  ("mixer-only" | "mixer+FFN")
+    stage2/train_loss_step   — loss mỗi log_freq steps
+    stage2/train_loss_epoch  — loss trung bình mỗi epoch
+    stage2/val_loss_epoch    — val loss mỗi epoch
+    stage2/lr                — learning rate
+    stage2/mse_block_{l:02d} — loss từng block (trung bình epoch)
 """
 
 import os
@@ -38,31 +33,21 @@ from models.teacher import TeacherModel
 from distillation.losses import hidden_state_l2_loss
 
 
-def set_stage2_trainable(student: BiMambaSLR, freeze_mlp: bool):
+def set_stage2_trainable(student: BiMambaSLR):
     """
-    Phase A (freeze_mlp=True):
-        trainable  = temporal_mamba
-        frozen     = embedding, spatial MHA, norm1/2, FFN, norm3, fc
-
-    Phase B (freeze_mlp=False):
-        trainable  = temporal_mamba + feed_forward_network + norm_layer3
-        frozen     = embedding, spatial MHA, norm1/2, fc
+    Theo phi-mamba Stage 2: train toàn bộ student ngoại trừ
+    embedding và lm_head (classification head).
 
     Mapping với phi-mamba:
-        frozen "mlp"            → feed_forward_network   (Phase A only)
-        frozen "input_layernorm"→ norm_layer1/2/3        (norm3 unfrozen in Phase B)
-        frozen "embedding"      → embedding
-        frozen "lm_head"        → fc
+        frozen "embedding"  → embedding
+        frozen "lm_head"    → fc (classification head)
+        trainable: tất cả blocks (temporal_mamba + FFN + norms)
     """
     for name, param in student.named_parameters():
-        if "temporal_mamba" in name:
-            param.requires_grad_(True)
-        elif not freeze_mlp and any(
-            k in name for k in ["feed_forward_network", "norm_layer3"]
-        ):
-            param.requires_grad_(True)
-        else:
+        if any(k in name for k in ["embedding", "fc"]):
             param.requires_grad_(False)
+        else:
+            param.requires_grad_(True)
 
 
 def train_stage2(
@@ -72,9 +57,9 @@ def train_stage2(
     val_dataloader: DataLoader = None,
     device: str = "cuda",
     lr: float = 5e-4,
-    num_epochs: int = 10,
-    freeze_mlp: bool = True,
-    log_freq: int = 50,
+    num_epochs: int = 20,
+    freeze_mlp: bool = False,   # False = full block alignment theo paper
+    log_freq: int = 10,
     wandb_run=None,
     save_path: str = None,
 ):
@@ -82,7 +67,7 @@ def train_stage2(
     teacher.to(device)
     student.to(device)
 
-    set_stage2_trainable(student, freeze_mlp)
+    set_stage2_trainable(student)
     student.train()
 
     optimizer = optim.AdamW(
@@ -92,11 +77,13 @@ def train_stage2(
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
     n_blocks = len(student.blocks)
-    mode     = "mixer-only" if freeze_mlp else "mixer+FFN"
     global_step = 0
 
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
-    print(f"[Stage2/{mode}] Trainable params: {trainable_params:,}")
+    print(f"[Stage2] Trainable params: {trainable_params:,}")
+    print(f"[Stage2] freeze_mlp={freeze_mlp} (False = full block alignment theo paper)")
+
+    best_val_loss = float("inf")
 
     for epoch in range(num_epochs):
         student.train()
@@ -106,56 +93,39 @@ def train_stage2(
         for step, batch in enumerate(dataloader):
             x = _get_x(batch, device)
 
-            # ── Teacher forward — thu thập hidden states ──────────────
+            # ── Teacher forward ───────────────────────────────────────
             with torch.no_grad():
                 t_out = teacher(x, return_attn=False, return_hidden_states=True)
 
-            block_inputs    = t_out["hidden_states"]    # list[n_blocks]  input  → block l
-            pre_ffn_states  = t_out["pre_ffn_states"]  # list[n_blocks]  TRƯỚC FFN
-            block_outputs   = t_out["block_outputs"]   # list[n_blocks]  full block output
+            block_inputs  = t_out["hidden_states"]   # list[n_blocks]: input → block l
+            block_outputs = t_out["block_outputs"]   # list[n_blocks]: full block output
 
-            # Guard
-            assert len(pre_ffn_states) == n_blocks, (
-                f"[Stage2] pre_ffn_states={len(pre_ffn_states)} ≠ n_blocks={n_blocks}. "
-                "Kiểm tra hook feed_forward_network trong TeacherModel."
-            )
-
-            # ── Backward per-block (phi-mamba pattern) ───────────────
-            # Gọi loss.backward() ngay sau mỗi block thay vì accumulate
-            # tất cả n blocks rồi backward một lần.
-            # → chỉ 1 computation graph trong memory tại mỗi thời điểm
-            # → giảm peak memory từ O(n_blocks) xuống O(1)
+            # ── Backward per-block (phi-mamba pattern) ────────────────
+            # loss.backward() ngay sau mỗi block → chỉ 1 graph trong memory
             optimizer.zero_grad()
             n         = min(n_blocks, len(block_inputs))
-            step_loss = 0.0   # chỉ để log, không dùng cho backward
+            step_loss = 0.0
 
             for l in range(n):
-                student_input = block_inputs[l].to(device)
-
-                # ── Target theo phi-mamba ─────────────────────────────
-                if freeze_mlp:
-                    teacher_target = pre_ffn_states[l].to(device)
-                else:
-                    teacher_target = block_outputs[l].to(device)
+                student_input  = block_inputs[l].to(device)
+                teacher_target = block_outputs[l].to(device)
 
                 s_out = student.blocks[l](
                     hidden_states=student_input,
-                    run_mlp_component=not freeze_mlp,
+                    run_mlp_component=True,        # full block (spatial+temporal+FFN)
                     return_transfer_matrix=False,
                 )
                 student_output = s_out["hidden_states"]
 
-                # Chia n để gradient scale nhất quán với loss trung bình
+                # L2 norm per-token, chia n để gradient scale nhất quán
                 block_loss = hidden_state_l2_loss(student_output, teacher_target) / n
 
-                # Backward ngay — giải phóng graph của block l trước block l+1
-                block_loss.backward()
+                block_loss.backward()   # giải phóng graph ngay
 
                 block_val = block_loss.item()
                 step_loss += block_val
                 mse_per_block[l] += block_val
 
-                # Giải phóng fragment memory giữa các blocks
                 del s_out, student_output, teacher_target, block_loss
                 if device != "cpu":
                     torch.cuda.empty_cache()
@@ -168,55 +138,70 @@ def train_stage2(
 
             if (step + 1) % log_freq == 0:
                 print(
-                    f"[Stage2/{mode}] Epoch {epoch+1}/{num_epochs}  "
+                    f"[Stage2] Epoch {epoch+1}/{num_epochs}  "
                     f"Step {step+1}/{len(dataloader)}  "
-                    f"Loss: {step_loss:.4f}"
+                    f"train_loss: {step_loss:.4f}"
                 )
                 if wandb_run is not None:
                     wandb_run.log({
-                        "stage2/loss_step": step_loss,
-                        "stage2/lr":        optimizer.param_groups[0]["lr"],
+                        "stage2/train_loss_step": step_loss,
+                        "stage2/lr": optimizer.param_groups[0]["lr"],
                     }, step=global_step)
 
         scheduler.step()
 
-        avg_loss = epoch_loss / len(dataloader)
-        avg_mse  = [m / len(dataloader) for m in mse_per_block]
-        print(f"[Stage2/{mode}] Epoch {epoch+1}/{num_epochs} — avg loss: {avg_loss:.4f}")
+        avg_train_loss = epoch_loss / len(dataloader)
+        avg_mse        = [m / len(dataloader) for m in mse_per_block]
 
         # ── Validation ────────────────────────────────────────────────
         val_loss = None
         if val_dataloader is not None:
             val_loss = _compute_val_loss(
-                student, teacher, val_dataloader, device, n_blocks, freeze_mlp
+                student, teacher, val_dataloader, device, n_blocks
             )
-            print(f"[Stage2/{mode}] Epoch {epoch+1}/{num_epochs} — val_loss:  {val_loss:.4f}")
 
+        # ── Console log ───────────────────────────────────────────────
+        val_str = f"  val_loss: {val_loss:.4f}" if val_loss is not None else ""
+        print(
+            f"[Stage2] Epoch {epoch+1}/{num_epochs} — "
+            f"train_loss: {avg_train_loss:.4f}{val_str}"
+        )
+
+        # ── Wandb log ─────────────────────────────────────────────────
         if wandb_run is not None:
             log_dict = {
-                "stage2/loss_epoch": avg_loss,
-                "stage2/epoch":      epoch + 1,
-                "stage2/phase":      mode,
+                "stage2/train_loss_epoch": avg_train_loss,
+                "stage2/epoch":            epoch + 1,
             }
             if val_loss is not None:
-                log_dict["stage2/val_loss"] = val_loss
+                log_dict["stage2/val_loss_epoch"] = val_loss
             for l, v in enumerate(avg_mse):
                 log_dict[f"stage2/mse_block_{l:02d}"] = v
             wandb_run.log(log_dict, step=global_step)
 
+        # ── Save best checkpoint (theo val_loss nếu có, else train_loss) ──
+        monitor = val_loss if val_loss is not None else avg_train_loss
+        if monitor < best_val_loss:
+            best_val_loss = monitor
+            if save_path:
+                _save(student, save_path)
+                print(f"[Stage2] ✓ Best checkpoint saved (loss={best_val_loss:.4f}) → {save_path}")
+
+    # Luôn save final checkpoint
     if save_path:
-        _save(student, save_path)
-        print(f"[Stage2] Checkpoint saved → {save_path}")
+        final_path = save_path.replace(".pth", "_final.pth")
+        _save(student, final_path)
+        print(f"[Stage2] Final checkpoint saved → {final_path}")
 
     return student
 
 
 @torch.no_grad()
-def _compute_val_loss(student, teacher, val_loader, device, n_blocks, freeze_mlp):
+def _compute_val_loss(student, teacher, val_loader, device, n_blocks):
     student.eval()
     total = 0.0
     count = 0
-    seq_len = student.seq_len - 1
+    seq_len = student.seq_len - 1   # seq_len sau khi thêm CLS token
 
     for batch in val_loader:
         x = _get_x(batch, device)
@@ -232,18 +217,17 @@ def _compute_val_loss(student, teacher, val_loader, device, n_blocks, freeze_mlp
                       .view(B * n_copies, C, seq_len, V, M_dim))
 
         t_out = teacher(x, return_attn=False, return_hidden_states=True)
-        block_inputs   = t_out["hidden_states"]
-        pre_ffn_states = t_out["pre_ffn_states"]
-        block_outputs  = t_out["block_outputs"]
+        block_inputs  = t_out["hidden_states"]
+        block_outputs = t_out["block_outputs"]
 
         n = min(n_blocks, len(block_inputs))
         for l in range(n):
             s_out = student.blocks[l](
                 hidden_states=block_inputs[l].to(device),
-                run_mlp_component=not freeze_mlp,
+                run_mlp_component=True,
                 return_transfer_matrix=False,
             )
-            target = (pre_ffn_states[l] if freeze_mlp else block_outputs[l]).to(device)
+            target = block_outputs[l].to(device)
             total += hidden_state_l2_loss(s_out["hidden_states"], target).item()
             count += 1
 
