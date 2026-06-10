@@ -15,12 +15,11 @@ Theo paper MOHAWK và phi-mamba/assets/mohawk_stage2.py:
 Backward per-block (phi-mamba pattern) để tiết kiệm memory:
     → backward() ngay sau mỗi block, chỉ giữ 1 computation graph tại 1 thời điểm
 
-Logs to wandb:
-    stage2/train_loss_step   — loss mỗi log_freq steps
-    stage2/train_loss_epoch  — loss trung bình mỗi epoch
-    stage2/val_loss_epoch    — val loss mỗi epoch
+Logs to wandb (X axis = stage2/epoch, khai báo bằng define_metric):
+    stage2/train_loss        — train loss trung bình mỗi epoch
+    stage2/val_loss          — val loss mỗi epoch
     stage2/lr                — learning rate
-    stage2/mse_block_{l:02d} — loss từng block (trung bình epoch)
+    stage2/block_{l:02d}_loss — loss từng block (trung bình epoch)
 """
 
 import os
@@ -162,17 +161,17 @@ def train_stage2(
             f"train_loss: {avg_train_loss:.4f}{val_str}"
         )
 
-        # ── Wandb log ─────────────────────────────────────────────────
+        # ── Wandb log — epoch là X axis (define_metric ở run_stage2.py) ──
         if wandb_run is not None:
             log_dict = {
-                "stage2/train_loss_epoch": avg_train_loss,
-                "stage2/lr":               optimizer.param_groups[0]["lr"],
-                "stage2/epoch":            epoch + 1,
+                "stage2/epoch":      epoch + 1,   # X axis (declared via define_metric)
+                "stage2/train_loss": avg_train_loss,
+                "stage2/lr":         optimizer.param_groups[0]["lr"],
             }
             if val_loss is not None:
-                log_dict["stage2/val_loss_epoch"] = val_loss
+                log_dict["stage2/val_loss"] = val_loss
             for l, v in enumerate(avg_mse):
-                log_dict[f"stage2/mse_block_{l:02d}"] = v
+                log_dict[f"stage2/block_{l:02d}_loss"] = v
             wandb_run.log(log_dict)
 
         # ── Save best checkpoint (theo val_loss nếu có, else train_loss) ──

@@ -126,6 +126,10 @@ def main():
             ),
             settings=wandb.Settings(console="off"),
         )
+        # Khai báo epoch là X axis cho tất cả stage2 metrics
+        # → tránh lỗi "no data for _step" khi wandb dùng internal step counter
+        wandb_run.define_metric("stage2/epoch")
+        wandb_run.define_metric("stage2/*", step_metric="stage2/epoch")
         print(f"Wandb : {wandb_run.url}\n")
 
     # ── Dataset ───────────────────────────────────────────────────────
