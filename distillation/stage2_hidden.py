@@ -142,11 +142,6 @@ def train_stage2(
                     f"Step {step+1}/{len(dataloader)}  "
                     f"train_loss: {step_loss:.4f}"
                 )
-                if wandb_run is not None:
-                    wandb_run.log({
-                        "stage2/train_loss_step": step_loss,
-                        "stage2/lr": optimizer.param_groups[0]["lr"],
-                    })
 
         scheduler.step()
 
@@ -171,6 +166,7 @@ def train_stage2(
         if wandb_run is not None:
             log_dict = {
                 "stage2/train_loss_epoch": avg_train_loss,
+                "stage2/lr":               optimizer.param_groups[0]["lr"],
                 "stage2/epoch":            epoch + 1,
             }
             if val_loss is not None:
