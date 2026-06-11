@@ -1,16 +1,26 @@
 """
 Stage 2 — Hidden State Alignment (MOHAWK).
 
-Theo paper MOHAWK và phi-mamba/assets/mohawk_stage2.py:
+Theo phi-mamba/assets/mohawk_stage2.py (default: freeze_mlp=True):
 
     Với mỗi block l:
-        student_input  = teacher.hidden_states[l]         ← input đến block l
-        student_output = student.blocks[l](student_input) ← full block (spatial+temporal+FFN)
-        teacher_target = teacher.block_outputs[l]         ← full block output
-        loss = ||student_output - teacher_target||_2      ← per-token L2 norm
+        student_input  = teacher.hidden_states[l]           ← input đến block l
+        student_output = student.blocks[l](student_input,
+                             run_mlp_component=False)       ← spatial+temporal only (no FFN)
+        teacher_target = teacher.pre_ffn_states[l]          ← phi-mamba: all_attn_outputs[l]
+        loss = ||student_output - teacher_target||_2        ← per-token L2 norm
 
-    freeze_mlp=False: tất cả parameter của block được train
-    (temporal_mamba + feed_forward_network + norm layers)
+    freeze_mlp=True  (phi-mamba default):
+        frozen : feed_forward_network, norm_layer3, embedding, fc
+        trained: multihead_self_attention1, temporal_mamba, norm_layer1, norm_layer2
+        target : pre_ffn_states[l]  (state trước FFN = sau temporal attention)
+        run_mlp_component=False
+
+    freeze_mlp=False (full block alignment):
+        frozen : embedding, fc
+        trained: tất cả block params
+        target : block_outputs[l]   (full block output)
+        run_mlp_component=True
 
 Backward per-block (phi-mamba pattern) để tiết kiệm memory:
     → backward() ngay sau mỗi block, chỉ giữ 1 computation graph tại 1 thời điểm
@@ -32,18 +42,28 @@ from models.teacher import TeacherModel
 from distillation.losses import hidden_state_l2_loss
 
 
-def set_stage2_trainable(student: BiMambaSLR):
+def set_stage2_trainable(student: BiMambaSLR, freeze_mlp: bool = True):
     """
-    Theo phi-mamba Stage 2: train toàn bộ student ngoại trừ
-    embedding và lm_head (classification head).
+    Theo phi-mamba Stage 2:
 
-    Mapping với phi-mamba:
-        frozen "embedding"  → embedding
-        frozen "lm_head"    → fc (classification head)
-        trainable: tất cả blocks (temporal_mamba + FFN + norms)
+    freeze_mlp=True  (phi-mamba default):
+        frozen  — "mlp" (feed_forward_network), "norm_layer3" (post-FFN norm),
+                  "embedding", "fc"
+        trained — "multihead_self_attention1", "norm_layer1",
+                  "temporal_mamba", "norm_layer2"
+        ↳ Chỉ train temporal SSM + spatial attn; FFN giữ nguyên từ Stage 1.
+
+    freeze_mlp=False (full block, ít dùng):
+        frozen  — "embedding", "fc"
+        trained — tất cả params trong blocks
     """
+    freeze_keys_base = ["embedding", "fc"]
+    freeze_keys_ffn  = ["feed_forward_network", "norm_layer3"]
+
     for name, param in student.named_parameters():
-        if any(k in name for k in ["embedding", "fc"]):
+        frozen_base = any(k in name for k in freeze_keys_base)
+        frozen_ffn  = freeze_mlp and any(k in name for k in freeze_keys_ffn)
+        if frozen_base or frozen_ffn:
             param.requires_grad_(False)
         else:
             param.requires_grad_(True)
@@ -57,7 +77,7 @@ def train_stage2(
     device: str = "cuda",
     lr: float = 5e-4,
     num_epochs: int = 20,
-    freeze_mlp: bool = False,   # False = full block alignment theo paper
+    freeze_mlp: bool = True,    # True = phi-mamba default: chỉ train temporal SSM + spatial attn
     log_freq: int = 10,
     wandb_run=None,
     save_path: str = None,
@@ -66,7 +86,7 @@ def train_stage2(
     teacher.to(device)
     student.to(device)
 
-    set_stage2_trainable(student)
+    set_stage2_trainable(student, freeze_mlp=freeze_mlp)
     student.train()
 
     optimizer = optim.AdamW(
@@ -79,8 +99,10 @@ def train_stage2(
     global_step = 0
 
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
-    print(f"[Stage2] Trainable params: {trainable_params:,}")
-    print(f"[Stage2] freeze_mlp={freeze_mlp} (False = full block alignment theo paper)")
+    target_desc = "pre_ffn_states (phi-mamba: all_attn_outputs)" if freeze_mlp else "block_outputs (full block)"
+    print(f"[Stage2] freeze_mlp={freeze_mlp}")
+    print(f"[Stage2] Target     : {target_desc}")
+    print(f"[Stage2] Trainable  : {trainable_params:,} params")
 
     best_val_loss = float("inf")
 
@@ -96,22 +118,27 @@ def train_stage2(
             with torch.no_grad():
                 t_out = teacher(x, return_attn=False, return_hidden_states=True)
 
-            block_inputs  = t_out["hidden_states"]   # list[n_blocks]: input → block l
-            block_outputs = t_out["block_outputs"]   # list[n_blocks]: full block output
+            block_inputs  = t_out["hidden_states"]    # list[n_blocks]: input → block l
+            # Target selection (phi-mamba mohawk_stage2.py):
+            #   freeze_mlp=True  → all_attn_outputs[l]    = pre_ffn_states[l]
+            #   freeze_mlp=False → all_hidden_states[l+1] = block_outputs[l]
+            teacher_targets = (
+                t_out["pre_ffn_states"] if freeze_mlp else t_out["block_outputs"]
+            )
 
             # ── Backward per-block (phi-mamba pattern) ────────────────
             # loss.backward() ngay sau mỗi block → chỉ 1 graph trong memory
             optimizer.zero_grad()
-            n         = min(n_blocks, len(block_inputs))
+            n         = min(n_blocks, len(block_inputs), len(teacher_targets))
             step_loss = 0.0
 
             for l in range(n):
                 student_input  = block_inputs[l].to(device)
-                teacher_target = block_outputs[l].to(device)
+                teacher_target = teacher_targets[l].to(device)
 
                 s_out = student.blocks[l](
                     hidden_states=student_input,
-                    run_mlp_component=True,        # full block (spatial+temporal+FFN)
+                    run_mlp_component=not freeze_mlp,  # False when freeze_mlp=True (phi-mamba)
                     return_transfer_matrix=False,
                 )
                 student_output = s_out["hidden_states"]
@@ -151,7 +178,7 @@ def train_stage2(
         val_loss = None
         if val_dataloader is not None:
             val_loss = _compute_val_loss(
-                student, teacher, val_dataloader, device, n_blocks
+                student, teacher, val_dataloader, device, n_blocks, freeze_mlp=freeze_mlp
             )
 
         # ── Console log ───────────────────────────────────────────────
@@ -192,7 +219,7 @@ def train_stage2(
 
 
 @torch.no_grad()
-def _compute_val_loss(student, teacher, val_loader, device, n_blocks):
+def _compute_val_loss(student, teacher, val_loader, device, n_blocks, freeze_mlp: bool = True):
     student.eval()
     total = 0.0
     count = 0
@@ -212,17 +239,19 @@ def _compute_val_loss(student, teacher, val_loader, device, n_blocks):
                       .view(B * n_copies, C, seq_len, V, M_dim))
 
         t_out = teacher(x, return_attn=False, return_hidden_states=True)
-        block_inputs  = t_out["hidden_states"]
-        block_outputs = t_out["block_outputs"]
+        block_inputs   = t_out["hidden_states"]
+        teacher_targets = (
+            t_out["pre_ffn_states"] if freeze_mlp else t_out["block_outputs"]
+        )
 
-        n = min(n_blocks, len(block_inputs))
+        n = min(n_blocks, len(block_inputs), len(teacher_targets))
         for l in range(n):
             s_out = student.blocks[l](
                 hidden_states=block_inputs[l].to(device),
-                run_mlp_component=True,
+                run_mlp_component=not freeze_mlp,
                 return_transfer_matrix=False,
             )
-            target = block_outputs[l].to(device)
+            target = teacher_targets[l].to(device)
             total += hidden_state_l2_loss(s_out["hidden_states"], target).item()
             count += 1
 

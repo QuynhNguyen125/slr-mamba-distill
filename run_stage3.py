@@ -74,11 +74,12 @@ D_CONV     = 3
 CHUNK_SIZE = 16
 
 # ── Stage 3 ───────────────────────────────────────────────────────────
-S3_EPOCHS   = 30
-S3_LR       = 1e-4       # LR nhỏ — fine-tuning toàn mô hình
-ALPHA       = 0.5        # weight KL loss; 1-ALPHA = weight CE
-TEMPERATURE = 4.0        # distillation temperature (Hinton et al.)
-GRAD_ACCUM  = 4          # effective batch = BATCH_SIZE * GRAD_ACCUM = 2 * 4 = 8
+S3_EPOCHS      = 35       # tổng = Phase A + Phase B
+S3_PHASE_A     = 5        # Phase A: train fc only (CE) → khởi động classifier
+S3_LR          = 1e-4    # LR Phase B; Phase A dùng lr*5
+ALPHA          = 0.5     # weight KL loss; 1-ALPHA = weight CE
+TEMPERATURE    = 4.0     # distillation temperature (Hinton et al.)
+GRAD_ACCUM     = 4       # effective batch = BATCH_SIZE * GRAD_ACCUM = 2 * 4 = 8
 
 LOG_FREQ = 10
 
@@ -125,7 +126,7 @@ def main():
                 seq_len=SEQ_LEN, n_joints=N_JOINTS,
                 embedding_dim=EMBEDDING_DIM, n_blocks=N_BLOCKS,
                 n_heads=N_HEADS, d_state=D_STATE, d_conv=D_CONV,
-                epochs=S3_EPOCHS, lr=S3_LR,
+                epochs=S3_EPOCHS, phase_a=S3_PHASE_A, lr=S3_LR,
                 alpha=ALPHA, temperature=TEMPERATURE,
                 batch_size=BATCH_SIZE, grad_accum=GRAD_ACCUM,
                 effective_batch=BATCH_SIZE * GRAD_ACCUM,
@@ -259,16 +260,16 @@ def main():
                 nan_count += n
                 torch.nan_to_num_(param.data, nan=0.0, posinf=1e-2, neginf=-1e-2)
         # Buffers: BatchNorm running_mean / running_var
+        # Chỉ reset nếu thực sự NaN/Inf — KHÔNG reset unconditionally
+        # vì Stage 2 running stats đã phản ánh đúng phân phối data
         for module in student.modules():
             if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                n = (torch.isnan(module.running_mean).sum() +
-                     torch.isinf(module.running_mean).sum() +
-                     torch.isnan(module.running_var).sum() +
-                     torch.isinf(module.running_var).sum()).item()
-                if n > 0:
-                    nan_count += n
-                module.running_mean.zero_()
-                module.running_var.fill_(1.0)
+                if torch.isnan(module.running_mean).any() or torch.isinf(module.running_mean).any():
+                    nan_count += torch.isnan(module.running_mean).sum().item()
+                    module.running_mean.zero_()
+                if torch.isnan(module.running_var).any() or torch.isinf(module.running_var).any():
+                    nan_count += torch.isnan(module.running_var).sum().item()
+                    module.running_var.fill_(1.0)
                 # Giảm momentum: EMA update chậm hơn → ít bị đột biến
                 module.momentum = 0.01   # default là 0.1
 
@@ -297,6 +298,7 @@ def main():
         device=DEVICE,
         lr=S3_LR,
         num_epochs=S3_EPOCHS,
+        phase_a_epochs=S3_PHASE_A,
         alpha=ALPHA,
         temperature=TEMPERATURE,
         grad_accum=GRAD_ACCUM,

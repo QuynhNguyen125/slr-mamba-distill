@@ -71,9 +71,12 @@ D_STATE    = 64
 D_CONV     = 3
 CHUNK_SIZE = 16
 
-# ── Stage 2: full block alignment (freeze_mlp=False) theo paper ──────
-S2_EPOCHS = 20    # train đến khi val loss hội tụ
-S2_LR     = 5e-4
+# ── Stage 2: hidden state alignment (freeze_mlp=True, phi-mamba default) ──
+# freeze_mlp=True: frozen FFN, train temporal SSM + spatial attn
+#   target = pre_ffn_states (phi-mamba: all_attn_outputs)
+FREEZE_MLP = True
+S2_EPOCHS  = 20   # train đến khi val loss hội tụ
+S2_LR      = 5e-4
 
 LOG_FREQ = 10
 
@@ -122,7 +125,7 @@ def main():
                 n_heads=N_HEADS, d_state=D_STATE, d_conv=D_CONV,
                 epochs=S2_EPOCHS, lr=S2_LR,
                 batch_size=BATCH_SIZE,
-                freeze_mlp=False,
+                freeze_mlp=FREEZE_MLP,
             ),
             settings=wandb.Settings(console="off"),
         )
@@ -235,12 +238,16 @@ def main():
     total = sum(p.numel() for p in student.parameters())
     print(f"Student params : {total:,}  ✓")
 
-    # ── Stage 2: Full block hidden state alignment (theo paper) ───────
+    # ── Stage 2: Hidden state alignment (freeze_mlp=True, phi-mamba default) ──
+    target_desc = (
+        "pre_ffn_states  (phi-mamba: all_attn_outputs)" if FREEZE_MLP
+        else "block_outputs   (phi-mamba: all_hidden_states[l+1])"
+    )
     print("\n" + "="*60)
-    print("=== Stage 2: Hidden State Alignment (freeze_mlp=False) ===")
+    print(f"=== Stage 2: Hidden State Alignment (freeze_mlp={FREEZE_MLP}) ===")
     print("="*60)
-    print("Target = teacher full block output  (phi-mamba: all_hidden_states[l+1])")
-    print(f"Epochs : {S2_EPOCHS}  |  LR : {S2_LR}")
+    print(f"Target  = {target_desc}")
+    print(f"Epochs  : {S2_EPOCHS}  |  LR : {S2_LR}")
 
     student = train_stage2(
         student=student,
@@ -250,7 +257,7 @@ def main():
         device=DEVICE,
         lr=S2_LR,
         num_epochs=S2_EPOCHS,
-        freeze_mlp=False,
+        freeze_mlp=FREEZE_MLP,
         log_freq=LOG_FREQ,
         wandb_run=wandb_run,
         save_path=os.path.join(OUTPUT_DIR, "student_stage2.pth"),

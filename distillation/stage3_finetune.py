@@ -40,13 +40,14 @@ def _sanitize_bn_buffers(model: nn.Module):
     """
     for module in model.modules():
         if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            # Chỉ reset nếu NaN/Inf, không reset vô điều kiện
             if torch.isnan(module.running_mean).any() or torch.isinf(module.running_mean).any():
                 module.running_mean.zero_()
             if torch.isnan(module.running_var).any() or torch.isinf(module.running_var).any():
                 module.running_var.fill_(1.0)
-            # Clamp để tránh tích lũy giá trị cực lớn
-            module.running_mean.clamp_(-1e4, 1e4)
-            module.running_var.clamp_(1e-6, 1e4)
+            # Clamp: tránh tích lũy giá trị cực lớn nhưng giữ nguyên phân phối
+            module.running_mean.clamp_(-1e3, 1e3)
+            module.running_var.clamp_(1e-6, 1e3)
 
 
 def set_stage3_trainable(student: BiMambaSLR):
@@ -66,6 +67,18 @@ def _compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     return (preds == tgts).float().mean().item()
 
 
+def _set_phase_a(student: BiMambaSLR):
+    """
+    Phase A: chỉ train fc (classification head).
+    fc chưa bao giờ được train → cần khởi động trước.
+    Spatial attention features → fc → classification.
+    """
+    for param in student.parameters():
+        param.requires_grad_(False)
+    for param in student.fc.parameters():
+        param.requires_grad_(True)
+
+
 def train_stage3(
     student: BiMambaSLR,
     teacher: TeacherModel,
@@ -74,6 +87,7 @@ def train_stage3(
     device: str = "cuda",
     lr: float = 1e-4,
     num_epochs: int = 30,
+    phase_a_epochs: int = 5,
     alpha: float = 0.5,
     temperature: float = 4.0,
     grad_accum: int = 4,
@@ -82,72 +96,162 @@ def train_stage3(
     save_path: str = None,
 ):
     """
-    Args:
-        alpha       : weight cho KL loss  (1-alpha = weight CE)
-        temperature : distillation temperature (Hinton et al. recommend T=4)
-        grad_accum  : gradient accumulation steps (effective_batch = batch_size * grad_accum)
+    2-phase Stage 3:
+      Phase A (phase_a_epochs): chỉ train fc với CE → khởi động classifier
+      Phase B (còn lại):        train toàn bộ với KL + CE → full distillation
+
+    Lý do cần Phase A:
+      - fc bị freeze suốt Stage 1 và 2 → random weights
+      - BiMamba2 collapse → temporal ≈ 0
+      - Nếu train toàn bộ ngay từ đầu, gradient qua 10 blocks near-identity
+        không đủ để fc học phân loại → val_acc < 1% (random)
     """
     teacher.eval()
     teacher.to(device)
     student.to(device)
 
-    set_stage3_trainable(student)
-    student.train()
-
-    # Bắt đầu với LR nhỏ (warmup 3 epoch): tránh gradient explosion từ Stage 2 checkpoint
-    WARMUP_EPOCHS = 3
-    optimizer = optim.AdamW(student.parameters(), lr=lr * 0.1, weight_decay=0.01)
-
-    def lr_lambda(epoch):
-        if epoch < WARMUP_EPOCHS:
-            return (epoch + 1) / WARMUP_EPOCHS  # linear warmup lên lr
-        # cosine decay sau warmup
-        progress = (epoch - WARMUP_EPOCHS) / max(num_epochs - WARMUP_EPOCHS, 1)
-        import math
-        return 0.5 * (1 + math.cos(math.pi * progress))
-
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
-    print(f"[Stage3] Trainable params: {trainable:,}  (all)")
-    print(f"[Stage3] alpha={alpha}  temperature={temperature}  lr={lr}  grad_accum={grad_accum}  warmup={WARMUP_EPOCHS}")
-
     best_val_acc = 0.0
     nan_batches_total = 0
 
-    for epoch in range(num_epochs):
+    # ══════════════════════════════════════════════════════════════════
+    # Phase A: train fc only với CE loss
+    # ══════════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print(f"Phase A: Train fc only ({phase_a_epochs} epochs, CE loss)")
+    print(f"{'='*60}")
+
+    _set_phase_a(student)
+    student.train()
+
+    opt_a = optim.AdamW(
+        filter(lambda p: p.requires_grad, student.parameters()),
+        lr=lr * 5,   # LR cao hơn vì chỉ train fc (nhỏ gọn, ít param)
+        weight_decay=0.01,
+    )
+    sched_a = optim.lr_scheduler.CosineAnnealingLR(opt_a, T_max=phase_a_epochs)
+
+    for epoch in range(phase_a_epochs):
+        student.train()
+        epoch_ce = 0.0
+        epoch_correct = epoch_total = 0
+        opt_a.zero_grad()
+
+        for step, batch in enumerate(dataloader):
+            x, labels = _get_x_labels(batch, device)
+
+            with torch.no_grad():
+                student_logits = student(x)   # fc không frozen nhưng grad blocked ở backbone
+
+            # Chỉ CE loss
+            ce   = classification_loss(student_logits, labels)
+            loss = ce / grad_accum
+            loss.backward()
+
+            epoch_ce += ce.item()
+            with torch.no_grad():
+                preds = student_logits.detach().argmax(dim=-1)
+                tgts  = labels.argmax(dim=-1) if (labels.dim() > 1 and labels.shape[-1] > 1) else labels.long().squeeze(-1)
+                epoch_correct += (preds == tgts).sum().item()
+                epoch_total   += tgts.size(0)
+
+            if (step + 1) % grad_accum == 0 or (step + 1) == len(dataloader):
+                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+                opt_a.step()
+                opt_a.zero_grad()
+                _sanitize_bn_buffers(student)
+                torch.cuda.empty_cache()
+
+        sched_a.step()
+        train_acc = epoch_correct / max(epoch_total, 1)
+
+        val_str = ""
+        if val_dataloader is not None:
+            val_loss_a, val_acc_a = _compute_val_metrics(
+                student, teacher, val_dataloader, device, alpha, temperature
+            )
+            val_str = f"  val_acc: {val_acc_a*100:.2f}%"
+            if val_acc_a > best_val_acc:
+                best_val_acc = val_acc_a
+                if save_path:
+                    _save(student, save_path, epoch, val_acc_a)
+
+        print(
+            f"[PhaseA] Epoch {epoch+1}/{phase_a_epochs} — "
+            f"ce: {epoch_ce/len(dataloader):.4f}  train_acc: {train_acc*100:.2f}%{val_str}"
+        )
+        if wandb_run is not None:
+            log = {
+                "stage3/epoch":      epoch + 1,
+                "stage3/train_loss": epoch_ce / len(dataloader),
+                "stage3/train_ce":   epoch_ce / len(dataloader),
+                "stage3/train_kl":   0.0,
+                "stage3/train_acc":  train_acc,
+                "stage3/lr":         opt_a.param_groups[0]["lr"],
+                "stage3/phase":      0,   # 0 = Phase A
+            }
+            if val_dataloader is not None:
+                log["stage3/val_loss"] = val_loss_a
+                log["stage3/val_acc"]  = val_acc_a
+            wandb_run.log(log)
+
+    print(f"\n[PhaseA] Done. Best val_acc so far: {best_val_acc*100:.2f}%")
+
+    # ══════════════════════════════════════════════════════════════════
+    # Phase B: full distillation KL + CE, all params
+    # ══════════════════════════════════════════════════════════════════
+    phase_b_epochs = num_epochs - phase_a_epochs
+    print(f"\n{'='*60}")
+    print(f"Phase B: Full distillation ({phase_b_epochs} epochs, KL + CE)")
+    print(f"{'='*60}")
+
+    set_stage3_trainable(student)
+    student.train()
+
+    import math
+    WARMUP_EPOCHS = 2
+    opt_b = optim.AdamW(student.parameters(), lr=lr * 0.1, weight_decay=0.01)
+
+    def lr_lambda(epoch):
+        if epoch < WARMUP_EPOCHS:
+            return (epoch + 1) / WARMUP_EPOCHS
+        progress = (epoch - WARMUP_EPOCHS) / max(phase_b_epochs - WARMUP_EPOCHS, 1)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    sched_b = optim.lr_scheduler.LambdaLR(opt_b, lr_lambda)
+
+    trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
+    print(f"[Stage3-B] Trainable: {trainable:,}  alpha={alpha}  T={temperature}  lr={lr}")
+    print(f"[Stage3-B] grad_accum={grad_accum}  warmup={WARMUP_EPOCHS}")
+
+    epoch_offset = phase_a_epochs   # offset cho wandb epoch axis
+
+    for epoch in range(phase_b_epochs):
         student.train()
         epoch_loss = epoch_kl = epoch_ce = 0.0
         epoch_correct = epoch_total = 0
         nan_batches = 0
 
-        optimizer.zero_grad()
+        opt_b.zero_grad()
 
         for step, batch in enumerate(dataloader):
             x, labels = _get_x_labels(batch, device)
 
-            # ── Teacher forward (frozen, no graph) ───────────────────
             with torch.no_grad():
                 teacher_logits = teacher(x)["logits"]
 
-            # ── Student forward (full, end-to-end) ────────────────────
             student_logits = student(x)
 
-            # ── NaN check — skip batch nếu output degenerate ──────────
             if torch.isnan(student_logits).any() or torch.isinf(student_logits).any():
                 nan_batches += 1
-                optimizer.zero_grad()
+                opt_b.zero_grad()
                 torch.cuda.empty_cache()
                 continue
 
-            # ── Loss (scaled by grad_accum) ───────────────────────────
             kl   = kl_distillation_loss(student_logits, teacher_logits, temperature)
             ce   = classification_loss(student_logits, labels)
             loss = (alpha * kl + (1 - alpha) * ce) / grad_accum
-
             loss.backward()
 
-            # ── Metrics (use unscaled loss for logging) ───────────────
             unscaled = loss.item() * grad_accum
             epoch_loss += unscaled
             epoch_kl   += kl.item()
@@ -159,78 +263,71 @@ def train_stage3(
                 epoch_correct += (preds == tgts).sum().item()
                 epoch_total   += tgts.size(0)
 
-            # ── Optimizer step every grad_accum steps ─────────────────
             if (step + 1) % grad_accum == 0 or (step + 1) == len(dataloader):
                 torch.nn.utils.clip_grad_norm_(student.parameters(), 0.5)
-                optimizer.step()
-                optimizer.zero_grad()
-                _sanitize_bn_buffers(student)   # giữ running stats sạch
+                opt_b.step()
+                opt_b.zero_grad()
+                _sanitize_bn_buffers(student)
                 torch.cuda.empty_cache()
 
             if (step + 1) % log_freq == 0:
                 print(
-                    f"[Stage3] Epoch {epoch+1}/{num_epochs}  "
+                    f"[Stage3-B] Epoch {epoch+1}/{phase_b_epochs}  "
                     f"Step {step+1}/{len(dataloader)}  "
-                    f"loss: {unscaled:.4f}  "
-                    f"kl: {kl.item():.4f}  "
-                    f"ce: {ce.item():.4f}"
+                    f"loss: {unscaled:.4f}  kl: {kl.item():.4f}  ce: {ce.item():.4f}"
                 )
 
-        scheduler.step()
+        sched_b.step()
         nan_batches_total += nan_batches
 
-        n_valid        = max(len(dataloader) - nan_batches, 1)
-        avg_loss       = epoch_loss / n_valid
-        avg_kl         = epoch_kl   / n_valid
-        avg_ce         = epoch_ce   / n_valid
-        train_acc      = epoch_correct / max(epoch_total, 1)
+        n_valid   = max(len(dataloader) - nan_batches, 1)
+        avg_loss  = epoch_loss / n_valid
+        avg_kl    = epoch_kl   / n_valid
+        avg_ce    = epoch_ce   / n_valid
+        train_acc = epoch_correct / max(epoch_total, 1)
 
-        # ── Validation ────────────────────────────────────────────────
         val_loss = val_acc = None
         if val_dataloader is not None:
             val_loss, val_acc = _compute_val_metrics(
                 student, teacher, val_dataloader, device, alpha, temperature
             )
 
-        # ── Console log ───────────────────────────────────────────────
         val_str = ""
         if val_loss is not None:
             val_str = f"  val_loss: {val_loss:.4f}  val_acc: {val_acc*100:.2f}%"
         nan_str = f"  nan_skip: {nan_batches}" if nan_batches > 0 else ""
         print(
-            f"[Stage3] Epoch {epoch+1}/{num_epochs} — "
+            f"[Stage3-B] Epoch {epoch+1}/{phase_b_epochs} — "
             f"loss: {avg_loss:.4f}  kl: {avg_kl:.4f}  ce: {avg_ce:.4f}  "
             f"train_acc: {train_acc*100:.2f}%{val_str}{nan_str}"
         )
 
-        # ── Wandb log ─────────────────────────────────────────────────
         if wandb_run is not None:
             log_dict = {
-                "stage3/epoch":      epoch + 1,
+                "stage3/epoch":      epoch_offset + epoch + 1,
                 "stage3/train_loss": avg_loss,
                 "stage3/train_kl":   avg_kl,
                 "stage3/train_ce":   avg_ce,
                 "stage3/train_acc":  train_acc,
-                "stage3/lr":         optimizer.param_groups[0]["lr"],
+                "stage3/lr":         opt_b.param_groups[0]["lr"],
+                "stage3/phase":      1,   # 1 = Phase B
             }
             if val_loss is not None:
                 log_dict["stage3/val_loss"] = val_loss
                 log_dict["stage3/val_acc"]  = val_acc
             wandb_run.log(log_dict)
 
-        # ── Save best checkpoint (theo val_acc > train_acc nếu có) ────
         monitor = val_acc if val_acc is not None else train_acc
         if monitor >= best_val_acc:
             best_val_acc = monitor
             if save_path:
-                _save(student, save_path, epoch, monitor)
-                print(f"[Stage3] ✓ Best checkpoint saved (acc={best_val_acc*100:.2f}%) → {save_path}")
+                _save(student, save_path, epoch_offset + epoch, monitor)
+                print(f"[Stage3-B] ✓ Best checkpoint (acc={best_val_acc*100:.2f}%) → {save_path}")
 
-    # Save final checkpoint
     if save_path:
         final_path = save_path.replace(".pth", "_final.pth")
-        _save(student, final_path, num_epochs - 1, best_val_acc)
-        print(f"[Stage3] Final checkpoint saved → {final_path}")
+        _save(student, final_path, epoch_offset + phase_b_epochs - 1, best_val_acc)
+        print(f"[Stage3] Final checkpoint → {final_path}")
 
     return student
 
