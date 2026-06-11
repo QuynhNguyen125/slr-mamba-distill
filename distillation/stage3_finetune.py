@@ -22,12 +22,31 @@ Logs to wandb (X axis = stage3/epoch, khai báo bằng define_metric):
 
 import os
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from models.student import BiMambaSLR
 from models.teacher import TeacherModel
 from distillation.losses import combined_stage3_loss, kl_distillation_loss, classification_loss
+
+
+def _sanitize_bn_buffers(model: nn.Module):
+    """
+    Sau mỗi optimizer step, reset BatchNorm running stats nếu bị NaN/Inf.
+    BatchNorm buffers (running_mean, running_var) là EMA của batch stats —
+    nếu một batch tạo ra activation cực lớn, EMA tích lũy → NaN.
+    Khi eval mode dùng running stats → crash.
+    """
+    for module in model.modules():
+        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            if torch.isnan(module.running_mean).any() or torch.isinf(module.running_mean).any():
+                module.running_mean.zero_()
+            if torch.isnan(module.running_var).any() or torch.isinf(module.running_var).any():
+                module.running_var.fill_(1.0)
+            # Clamp để tránh tích lũy giá trị cực lớn
+            module.running_mean.clamp_(-1e4, 1e4)
+            module.running_var.clamp_(1e-6, 1e4)
 
 
 def set_stage3_trainable(student: BiMambaSLR):
@@ -75,19 +94,32 @@ def train_stage3(
     set_stage3_trainable(student)
     student.train()
 
-    optimizer = optim.AdamW(student.parameters(), lr=lr, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    # Bắt đầu với LR nhỏ (warmup 3 epoch): tránh gradient explosion từ Stage 2 checkpoint
+    WARMUP_EPOCHS = 3
+    optimizer = optim.AdamW(student.parameters(), lr=lr * 0.1, weight_decay=0.01)
+
+    def lr_lambda(epoch):
+        if epoch < WARMUP_EPOCHS:
+            return (epoch + 1) / WARMUP_EPOCHS  # linear warmup lên lr
+        # cosine decay sau warmup
+        progress = (epoch - WARMUP_EPOCHS) / max(num_epochs - WARMUP_EPOCHS, 1)
+        import math
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     print(f"[Stage3] Trainable params: {trainable:,}  (all)")
-    print(f"[Stage3] alpha={alpha}  temperature={temperature}  lr={lr}  grad_accum={grad_accum}")
+    print(f"[Stage3] alpha={alpha}  temperature={temperature}  lr={lr}  grad_accum={grad_accum}  warmup={WARMUP_EPOCHS}")
 
     best_val_acc = 0.0
+    nan_batches_total = 0
 
     for epoch in range(num_epochs):
         student.train()
         epoch_loss = epoch_kl = epoch_ce = 0.0
         epoch_correct = epoch_total = 0
+        nan_batches = 0
 
         optimizer.zero_grad()
 
@@ -100,6 +132,13 @@ def train_stage3(
 
             # ── Student forward (full, end-to-end) ────────────────────
             student_logits = student(x)
+
+            # ── NaN check — skip batch nếu output degenerate ──────────
+            if torch.isnan(student_logits).any() or torch.isinf(student_logits).any():
+                nan_batches += 1
+                optimizer.zero_grad()
+                torch.cuda.empty_cache()
+                continue
 
             # ── Loss (scaled by grad_accum) ───────────────────────────
             kl   = kl_distillation_loss(student_logits, teacher_logits, temperature)
@@ -122,9 +161,10 @@ def train_stage3(
 
             # ── Optimizer step every grad_accum steps ─────────────────
             if (step + 1) % grad_accum == 0 or (step + 1) == len(dataloader):
-                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(student.parameters(), 0.5)
                 optimizer.step()
                 optimizer.zero_grad()
+                _sanitize_bn_buffers(student)   # giữ running stats sạch
                 torch.cuda.empty_cache()
 
             if (step + 1) % log_freq == 0:
@@ -137,11 +177,12 @@ def train_stage3(
                 )
 
         scheduler.step()
+        nan_batches_total += nan_batches
 
-        n_steps        = len(dataloader)
-        avg_loss       = epoch_loss / n_steps
-        avg_kl         = epoch_kl   / n_steps
-        avg_ce         = epoch_ce   / n_steps
+        n_valid        = max(len(dataloader) - nan_batches, 1)
+        avg_loss       = epoch_loss / n_valid
+        avg_kl         = epoch_kl   / n_valid
+        avg_ce         = epoch_ce   / n_valid
         train_acc      = epoch_correct / max(epoch_total, 1)
 
         # ── Validation ────────────────────────────────────────────────
@@ -155,10 +196,11 @@ def train_stage3(
         val_str = ""
         if val_loss is not None:
             val_str = f"  val_loss: {val_loss:.4f}  val_acc: {val_acc*100:.2f}%"
+        nan_str = f"  nan_skip: {nan_batches}" if nan_batches > 0 else ""
         print(
             f"[Stage3] Epoch {epoch+1}/{num_epochs} — "
             f"loss: {avg_loss:.4f}  kl: {avg_kl:.4f}  ce: {avg_ce:.4f}  "
-            f"train_acc: {train_acc*100:.2f}%{val_str}"
+            f"train_acc: {train_acc*100:.2f}%{val_str}{nan_str}"
         )
 
         # ── Wandb log ─────────────────────────────────────────────────

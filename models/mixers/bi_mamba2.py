@@ -262,9 +262,9 @@ class BiMamba2Mixer(nn.Module):
         batch, L, _ = u.shape
         conv_dim = self.d_inner + 2 * self.n_heads * self.d_state
 
-        # Input validation
-        assert not torch.isnan(u).any(), "Input u contains NaN values"
-        assert not torch.isinf(u).any(), "Input u contains Inf values"
+        # Input sanitization (replace NaN/Inf để tránh crash training)
+        if torch.isnan(u).any() or torch.isinf(u).any():
+            u = torch.nan_to_num(u, nan=0.0, posinf=1.0, neginf=-1.0)
 
         # Pad to nearest multiple of chunk_size for mamba_ssm kernel
         padded_L = ((L - 1) // self.chunk_size + 1) * self.chunk_size

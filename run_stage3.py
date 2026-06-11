@@ -247,6 +247,37 @@ def main():
     )
     ckpt = torch.load(student_ckpt, map_location=DEVICE, weights_only=False)
     student.load_state_dict(ckpt.get("model_state_dict", ckpt))
+
+    # Sanitize params và buffers từ Stage 2
+    import torch.nn as nn
+    nan_count = 0
+    with torch.no_grad():
+        # Params (learnable weights)
+        for name, param in student.named_parameters():
+            n = torch.isnan(param).sum().item() + torch.isinf(param).sum().item()
+            if n > 0:
+                nan_count += n
+                torch.nan_to_num_(param.data, nan=0.0, posinf=1e-2, neginf=-1e-2)
+        # Buffers: BatchNorm running_mean / running_var
+        for module in student.modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                n = (torch.isnan(module.running_mean).sum() +
+                     torch.isinf(module.running_mean).sum() +
+                     torch.isnan(module.running_var).sum() +
+                     torch.isinf(module.running_var).sum()).item()
+                if n > 0:
+                    nan_count += n
+                module.running_mean.zero_()
+                module.running_var.fill_(1.0)
+                # Giảm momentum: EMA update chậm hơn → ít bị đột biến
+                module.momentum = 0.01   # default là 0.1
+
+    if nan_count > 0:
+        print(f"[WARN] Sanitized {nan_count} NaN/Inf values in Stage 2 checkpoint")
+    else:
+        print("Weights OK (no NaN/Inf)")
+    print("BatchNorm momentum set to 0.01 (stable EMA)")
+
     total = sum(p.numel() for p in student.parameters())
     print(f"Student params : {total:,}  ✓")
 
