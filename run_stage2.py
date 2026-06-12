@@ -74,8 +74,10 @@ CHUNK_SIZE = 16
 # ── Stage 2: hidden state alignment (freeze_mlp=True, phi-mamba default) ──
 # freeze_mlp=True: frozen FFN, train temporal SSM + spatial attn
 #   target = pre_ffn_states (phi-mamba: all_attn_outputs)
+# Stopping criterion: dừng khi Δval_loss < 0.03 trong 3 epoch liên tiếp
+#   (Epoch 1-20 giảm từ 3.5 → 2.0; cần ~10 epoch nữa đến plateau ~1.85-1.90)
 FREEZE_MLP = True
-S2_EPOCHS  = 20   # train đến khi val loss hội tụ
+S2_EPOCHS  = 30   # tăng từ 20 → 30 (val_loss vẫn giảm ở epoch 20)
 S2_LR      = 5e-4
 
 LOG_FREQ = 10
@@ -83,7 +85,7 @@ LOG_FREQ = 10
 # ── Wandb ─────────────────────────────────────────────────────────────
 USE_WANDB     = True
 WANDB_PROJECT = "slr-mamba-distill"
-WANDB_NAME    = "stage2-wlasl100"
+WANDB_NAME    = "stage2-wlasl100-v2"  # v2: freeze_mlp=True, 30 epochs
 
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

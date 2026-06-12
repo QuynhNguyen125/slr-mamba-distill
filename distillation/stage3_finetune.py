@@ -139,8 +139,14 @@ def train_stage3(
         for step, batch in enumerate(dataloader):
             x, labels = _get_x_labels(batch, device)
 
-            with torch.no_grad():
-                student_logits = student(x)   # fc không frozen nhưng grad blocked ở backbone
+            # BUG FIX: KHÔNG dùng torch.no_grad() ở đây.
+            # - Backbone params đã có requires_grad=False → không cần grad
+            # - fc params có requires_grad=True → CẦN grad để update
+            # - torch.no_grad() sẽ khiến student_logits không có grad_fn
+            #   → loss.backward() raise RuntimeError (không có gradient)
+            # - PyTorch đủ thông minh: backward chỉ tính grad cho fc params,
+            #   không đi qua backbone (backbone output có requires_grad=False)
+            student_logits = student(x)
 
             # Chỉ CE loss
             ce   = classification_loss(student_logits, labels)
@@ -338,6 +344,7 @@ def _compute_val_metrics(student, teacher, val_loader, device, alpha, temperatur
     Val loss và accuracy với k_copies multi-crop:
         - Mỗi sample được crop k lần → tensor (B, C, T*k, V, M)
         - Reshape → (B*k, C, T, V, M) → forward từng clip → average logits → vote
+    @torch.no_grad(): tiết kiệm memory (không build backward graph trong val)
     """
     student.eval()
 

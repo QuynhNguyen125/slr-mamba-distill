@@ -86,7 +86,7 @@ LOG_FREQ = 10
 # ── Wandb ─────────────────────────────────────────────────────────────
 USE_WANDB     = True
 WANDB_PROJECT = "slr-mamba-distill"
-WANDB_NAME    = "stage3-wlasl100"
+WANDB_NAME    = "stage3-wlasl100-v2"  # v2: từ stage2 freeze_mlp=True (fixed)
 
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -282,11 +282,34 @@ def main():
     total = sum(p.numel() for p in student.parameters())
     print(f"Student params : {total:,}  ✓")
 
+    # ── NaN diagnostic: kiểm tra nhanh student trước khi train ───────
+    # Dùng 1 batch từ train_loader đã tạo ở trên
+    print("\n[NaN check] Running quick diagnostic forward pass...")
+    student.eval()
+    with torch.no_grad():
+        try:
+            _batch = next(iter(train_loader))
+            _x = _batch["skeleton_data"].to(DEVICE).float() if isinstance(_batch, dict) else _batch[0].to(DEVICE).float()
+            _logits = student(_x)
+            _nan = torch.isnan(_logits).any().item()
+            _inf = torch.isinf(_logits).any().item()
+            print(f"  logits shape : {_logits.shape}")
+            print(f"  logits range : [{_logits.min().item():.3f}, {_logits.max().item():.3f}]")
+            if _nan or _inf:
+                print(f"  ⚠ NaN={_nan}  Inf={_inf} — checkpoint có vấn đề, kiểm tra Stage 2!")
+            else:
+                print(f"  ✓ No NaN/Inf — checkpoint clean, sẵn sàng Stage 3")
+        except Exception as _e:
+            print(f"  [WARN] Diagnostic failed: {_e}")
+    student.train()
+
     # ── Stage 3: Full KL+CE distillation ─────────────────────────────
     print("\n" + "="*60)
     print("=== Stage 3: Full Distillation (KL + CE) ===")
     print("="*60)
     print(f"Loss = {ALPHA} * KL(T={TEMPERATURE}) + {1-ALPHA} * CE")
+    print(f"Phase A: {S3_PHASE_A} epochs, fc only, CE loss  (fc chưa được train qua Stage 1+2)")
+    print(f"Phase B: {S3_EPOCHS - S3_PHASE_A} epochs, full KL+CE")
     print(f"Epochs : {S3_EPOCHS}  |  LR : {S3_LR}")
     print(f"Target : val_acc ≈ teacher ({82.54}%)")
 
