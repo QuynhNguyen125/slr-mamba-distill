@@ -345,10 +345,16 @@ def _compute_val_metrics(student, teacher, val_loader, device, alpha, temperatur
         - Mỗi sample được crop k lần → tensor (B, C, T*k, V, M)
         - Reshape → (B*k, C, T, V, M) → forward từng clip → average logits → vote
     @torch.no_grad(): tiết kiệm memory (không build backward graph trong val)
+
+    NaN guard: skip batches có NaN student logits (BN running stats chưa kịp
+    recalibrate ở epoch đầu). Loss chỉ tính trên batches hợp lệ; accuracy tính
+    riêng để không bị mask bởi NaN.
     """
     student.eval()
 
-    total_loss = total_correct = total_samples = 0
+    total_loss = 0.0
+    total_correct = total_samples = 0
+    valid_loss_batches = 0
     seq_len = student.seq_len - 1   # trừ CLS token
 
     for batch in val_loader:
@@ -363,9 +369,26 @@ def _compute_val_metrics(student, teacher, val_loader, device, alpha, temperatur
         # Student logits
         student_logits_clips = student(x_clips)             # (B*k, C)
 
+        # NaN guard: nếu student logits có NaN/Inf → BN stats chưa hội tụ
+        # Skip batch này cho loss; accuracy vẫn dùng nan_to_num để đếm đúng/sai
+        has_nan = (torch.isnan(student_logits_clips).any() or
+                   torch.isinf(student_logits_clips).any())
+
         # Average over copies → (B, C)
         B_total, num_cls = student_logits_clips.shape
         B = B_total // k_copies
+
+        if has_nan:
+            # Accuracy với logits đã clamp (NaN → 0): ít nhất biết được progress
+            s_safe = torch.nan_to_num(student_logits_clips, nan=0.0, posinf=1e4, neginf=-1e4)
+            s_logits_safe = s_safe.view(B, k_copies, num_cls).mean(dim=1)
+            preds = s_logits_safe.argmax(dim=-1)
+            tgts  = (labels.argmax(dim=-1) if (labels.dim() > 1 and labels.shape[-1] > 1)
+                     else labels.long().squeeze(-1))
+            total_correct += (preds == tgts).sum().item()
+            total_samples += tgts.size(0)
+            continue   # skip loss accumulation
+
         s_logits = student_logits_clips.view(B, k_copies, num_cls).mean(dim=1)
         t_logits = teacher_logits_clips.view(B, k_copies, num_cls).mean(dim=1)
 
@@ -373,17 +396,22 @@ def _compute_val_metrics(student, teacher, val_loader, device, alpha, temperatur
         kl   = kl_distillation_loss(s_logits, t_logits, temperature)
         ce   = classification_loss(s_logits, labels)
         loss = alpha * kl + (1 - alpha) * ce
+        loss_val = loss.item()
+
+        # Secondary NaN check: KL có thể NaN nếu logits cực lớn (overflow trong exp)
+        if not (loss_val != loss_val):   # not NaN
+            total_loss        += loss_val
+            valid_loss_batches += 1
 
         preds   = s_logits.argmax(dim=-1)
-        tgts    = labels.argmax(dim=-1) if (labels.dim() > 1 and labels.shape[-1] > 1) else labels.long().squeeze(-1)
-        correct = (preds == tgts).sum().item()
-
-        total_loss    += loss.item()
-        total_correct += correct
+        tgts    = (labels.argmax(dim=-1) if (labels.dim() > 1 and labels.shape[-1] > 1)
+                   else labels.long().squeeze(-1))
+        total_correct += (preds == tgts).sum().item()
         total_samples += tgts.size(0)
 
     student.train()
-    avg_loss = total_loss / max(len(val_loader), 1)
+    # avg_loss = NaN nếu không có batch hợp lệ (toàn NaN) → wandb sẽ hiện NaN
+    avg_loss = total_loss / max(valid_loss_batches, 1) if valid_loss_batches > 0 else float("nan")
     accuracy = total_correct / max(total_samples, 1)
     return avg_loss, accuracy
 

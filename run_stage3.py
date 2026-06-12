@@ -260,24 +260,24 @@ def main():
                 nan_count += n
                 torch.nan_to_num_(param.data, nan=0.0, posinf=1e-2, neginf=-1e-2)
         # Buffers: BatchNorm running_mean / running_var
-        # Chỉ reset nếu thực sự NaN/Inf — KHÔNG reset unconditionally
-        # vì Stage 2 running stats đã phản ánh đúng phân phối data
+        # LUÔN reset unconditionally — Stage 2 calibrate BN stats trên TEACHER hidden states
+        # (mỗi block được feed độc lập bằng teacher output), không phải end-to-end student
+        # representations. Dùng stats đó trong Stage 3 eval mode → sai distribution → NaN.
+        # Reset về zero/one → BN tự recalibrate trong Phase A (train mode cập nhật running stats).
+        bn_reset_count = 0
         for module in student.modules():
             if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                if torch.isnan(module.running_mean).any() or torch.isinf(module.running_mean).any():
-                    nan_count += torch.isnan(module.running_mean).sum().item()
-                    module.running_mean.zero_()
-                if torch.isnan(module.running_var).any() or torch.isinf(module.running_var).any():
-                    nan_count += torch.isnan(module.running_var).sum().item()
-                    module.running_var.fill_(1.0)
-                # Giảm momentum: EMA update chậm hơn → ít bị đột biến
-                module.momentum = 0.01   # default là 0.1
+                module.running_mean.zero_()
+                module.running_var.fill_(1.0)
+                module.momentum = 0.01   # EMA update chậm hơn → ổn định hơn
+                bn_reset_count += 1
 
     if nan_count > 0:
         print(f"[WARN] Sanitized {nan_count} NaN/Inf values in Stage 2 checkpoint")
     else:
-        print("Weights OK (no NaN/Inf)")
-    print("BatchNorm momentum set to 0.01 (stable EMA)")
+        print("Weights OK (no NaN/Inf in learnable params)")
+    print(f"BatchNorm: reset {bn_reset_count} BN layers (running stats từ Stage 2 không valid cho end-to-end)")
+    print(f"BatchNorm momentum set to 0.01 (stable EMA)")
 
     total = sum(p.numel() for p in student.parameters())
     print(f"Student params : {total:,}  ✓")
