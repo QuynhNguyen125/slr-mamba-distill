@@ -74,18 +74,21 @@ CHUNK_SIZE = 16
 # ── Stage 2: hidden state alignment (freeze_mlp=True, phi-mamba default) ──
 # freeze_mlp=True: frozen FFN, train temporal SSM + spatial attn
 #   target = pre_ffn_states (phi-mamba: all_attn_outputs)
-# Stopping criterion: dừng khi Δval_loss < 0.03 trong 3 epoch liên tiếp
-#   (Epoch 1-20 giảm từ 3.5 → 2.0; cần ~10 epoch nữa đến plateau ~1.85-1.90)
 FREEZE_MLP = True
-S2_EPOCHS  = 30   # tăng từ 20 → 30 (val_loss vẫn giảm ở epoch 20)
+S2_EPOCHS  = 50   # 30 → 50: kiểm tra xem val_loss có tiếp tục giảm không
 S2_LR      = 5e-4
+
+# ── Resume: tiếp tục từ checkpoint Stage 2 (30 epoch) hay từ Stage 1? ──
+# True  → load student_stage2.pth  (chỉ train thêm 20 epoch nữa, nhanh hơn)
+# False → load student_stage1.pth  (fresh 50 epoch từ đầu, so sánh sạch hơn)
+CONTINUE_FROM_STAGE2 = True
 
 LOG_FREQ = 10
 
 # ── Wandb ─────────────────────────────────────────────────────────────
 USE_WANDB     = True
 WANDB_PROJECT = "slr-mamba-distill"
-WANDB_NAME    = "stage2-wlasl100-v2"  # v2: freeze_mlp=True, 30 epochs
+WANDB_NAME    = "stage2-wlasl100-v3"  # v3: 50 epoch (continue từ 30ep hoặc fresh)
 
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -211,12 +214,18 @@ def main():
     teacher.to(DEVICE).eval()
     print("Teacher loaded ✓")
 
-    # ── Student — load từ Stage 1 checkpoint ──────────────────────────
-    print(f"\nLoading student từ Stage 1: {STUDENT_STAGE1_CKPT}")
-    if not os.path.exists(STUDENT_STAGE1_CKPT):
-        print(f"[ERROR] Stage 1 checkpoint không tồn tại: {STUDENT_STAGE1_CKPT}")
-        print("Hãy chạy run_stage1.py trước.")
-        sys.exit(1)
+    # ── Student — load từ Stage 2 (continue) hoặc Stage 1 (fresh) ───────
+    STAGE2_CKPT = os.path.join(OUTPUT_DIR, "student_stage2.pth")
+    if CONTINUE_FROM_STAGE2 and os.path.exists(STAGE2_CKPT):
+        student_ckpt = STAGE2_CKPT
+        print(f"\nLoading student từ Stage 2 (continue): {student_ckpt}")
+    else:
+        student_ckpt = STUDENT_STAGE1_CKPT
+        print(f"\nLoading student từ Stage 1 (fresh): {student_ckpt}")
+        if not os.path.exists(student_ckpt):
+            print(f"[ERROR] Stage 1 checkpoint không tồn tại: {student_ckpt}")
+            print("Hãy chạy run_stage1.py trước.")
+            sys.exit(1)
 
     student = BiMambaSLR(
         in_channels=IN_CHANNELS,
@@ -235,7 +244,7 @@ def main():
         d_conv=D_CONV,
         chunk_size=CHUNK_SIZE,
     )
-    ckpt = torch.load(STUDENT_STAGE1_CKPT, map_location=DEVICE, weights_only=False)
+    ckpt = torch.load(student_ckpt, map_location=DEVICE, weights_only=False)
     student.load_state_dict(ckpt.get("model_state_dict", ckpt))
     total = sum(p.numel() for p in student.parameters())
     print(f"Student params : {total:,}  ✓")
@@ -251,6 +260,7 @@ def main():
     print(f"Target  = {target_desc}")
     print(f"Epochs  : {S2_EPOCHS}  |  LR : {S2_LR}")
 
+    save_name = "student_stage2_50ep.pth"
     student = train_stage2(
         student=student,
         teacher=teacher,
@@ -262,9 +272,9 @@ def main():
         freeze_mlp=FREEZE_MLP,
         log_freq=LOG_FREQ,
         wandb_run=wandb_run,
-        save_path=os.path.join(OUTPUT_DIR, "student_stage2.pth"),
+        save_path=os.path.join(OUTPUT_DIR, save_name),
     )
-    print(f"\n✓ Stage 2 xong → {OUTPUT_DIR}/student_stage2.pth")
+    print(f"\n✓ Stage 2 xong → {OUTPUT_DIR}/{save_name}")
 
     if wandb_run is not None:
         wandb_run.finish()

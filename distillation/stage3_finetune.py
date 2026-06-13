@@ -92,6 +92,7 @@ def train_stage3(
     temperature: float = 4.0,
     grad_accum: int = 4,
     log_freq: int = 10,
+    patience: int = 15,
     wandb_run=None,
     save_path: str = None,
 ):
@@ -227,9 +228,10 @@ def train_stage3(
 
     trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     print(f"[Stage3-B] Trainable: {trainable:,}  alpha={alpha}  T={temperature}  lr={lr}")
-    print(f"[Stage3-B] grad_accum={grad_accum}  warmup={WARMUP_EPOCHS}")
+    print(f"[Stage3-B] grad_accum={grad_accum}  warmup={WARMUP_EPOCHS}  patience={patience}")
 
     epoch_offset = phase_a_epochs   # offset cho wandb epoch axis
+    epochs_no_improve = 0           # early stopping counter
 
     for epoch in range(phase_b_epochs):
         student.train()
@@ -326,9 +328,16 @@ def train_stage3(
         monitor = val_acc if val_acc is not None else train_acc
         if monitor >= best_val_acc:
             best_val_acc = monitor
+            epochs_no_improve = 0
             if save_path:
                 _save(student, save_path, epoch_offset + epoch, monitor)
                 print(f"[Stage3-B] ✓ Best checkpoint (acc={best_val_acc*100:.2f}%) → {save_path}")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"[Stage3-B] Early stopping: val_acc không tăng sau {patience} epoch. "
+                      f"Best={best_val_acc*100:.2f}%")
+                break
 
     if save_path:
         final_path = save_path.replace(".pth", "_final.pth")

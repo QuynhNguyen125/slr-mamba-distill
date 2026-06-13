@@ -74,19 +74,20 @@ D_CONV     = 3
 CHUNK_SIZE = 16
 
 # ── Stage 3 ───────────────────────────────────────────────────────────
-S3_EPOCHS      = 35       # tổng = Phase A + Phase B
-S3_PHASE_A     = 5        # Phase A: train fc only (CE) → khởi động classifier
+S3_EPOCHS      = 100      # tổng = Phase A + Phase B (teacher train 1500 epoch → cần đủ)
+S3_PHASE_A     = 10       # Phase A: train fc only (CE) → khởi động classifier
 S3_LR          = 1e-4    # LR Phase B; Phase A dùng lr*5
 ALPHA          = 0.5     # weight KL loss; 1-ALPHA = weight CE
 TEMPERATURE    = 4.0     # distillation temperature (Hinton et al.)
 GRAD_ACCUM     = 4       # effective batch = BATCH_SIZE * GRAD_ACCUM = 2 * 4 = 8
+PATIENCE       = 15       # early stopping Phase B: dừng nếu val_acc không tăng sau N epoch
 
 LOG_FREQ = 10
 
 # ── Wandb ─────────────────────────────────────────────────────────────
 USE_WANDB     = True
 WANDB_PROJECT = "slr-mamba-distill"
-WANDB_NAME    = "stage3-wlasl100-v2"  # v2: từ stage2 freeze_mlp=True (fixed)
+WANDB_NAME    = "stage3-wlasl100-v3"  # v3: stage2 30 epoch freeze_mlp=True + epochs=100 + early_stop
 
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -130,6 +131,7 @@ def main():
                 alpha=ALPHA, temperature=TEMPERATURE,
                 batch_size=BATCH_SIZE, grad_accum=GRAD_ACCUM,
                 effective_batch=BATCH_SIZE * GRAD_ACCUM,
+                patience=PATIENCE,
             ),
             settings=wandb.Settings(console="off"),
         )
@@ -309,7 +311,7 @@ def main():
     print("="*60)
     print(f"Loss = {ALPHA} * KL(T={TEMPERATURE}) + {1-ALPHA} * CE")
     print(f"Phase A: {S3_PHASE_A} epochs, fc only, CE loss  (fc chưa được train qua Stage 1+2)")
-    print(f"Phase B: {S3_EPOCHS - S3_PHASE_A} epochs, full KL+CE")
+    print(f"Phase B: {S3_EPOCHS - S3_PHASE_A} epochs, full KL+CE  (early stop patience={PATIENCE})")
     print(f"Epochs : {S3_EPOCHS}  |  LR : {S3_LR}")
     print(f"Target : val_acc ≈ teacher ({82.54}%)")
 
@@ -326,6 +328,7 @@ def main():
         temperature=TEMPERATURE,
         grad_accum=GRAD_ACCUM,
         log_freq=LOG_FREQ,
+        patience=PATIENCE,
         wandb_run=wandb_run,
         save_path=os.path.join(OUTPUT_DIR, "student_stage3.pth"),
     )
