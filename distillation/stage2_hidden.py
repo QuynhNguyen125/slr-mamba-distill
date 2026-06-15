@@ -76,9 +76,11 @@ def train_stage2(
     val_dataloader: DataLoader = None,
     device: str = "cuda",
     lr: float = 5e-4,
-    num_epochs: int = 20,
+    num_epochs: int = 100,
     freeze_mlp: bool = True,    # True = phi-mamba default: chỉ train temporal SSM + spatial attn
     log_freq: int = 10,
+    patience: int = 10,         # early stopping: dừng nếu val_loss không giảm sau N epoch
+    min_delta: float = 0.005,   # cải thiện tối thiểu để tính là "có tiến bộ"
     wandb_run=None,
     save_path: str = None,
 ):
@@ -103,8 +105,10 @@ def train_stage2(
     print(f"[Stage2] freeze_mlp={freeze_mlp}")
     print(f"[Stage2] Target     : {target_desc}")
     print(f"[Stage2] Trainable  : {trainable_params:,} params")
+    print(f"[Stage2] Early stop : patience={patience}  min_delta={min_delta}")
 
-    best_val_loss = float("inf")
+    best_val_loss    = float("inf")
+    epochs_no_improve = 0
 
     for epoch in range(num_epochs):
         student.train()
@@ -201,13 +205,26 @@ def train_stage2(
                 log_dict[f"stage2/block_{l:02d}_loss"] = v
             wandb_run.log(log_dict)
 
-        # ── Save best checkpoint (theo val_loss nếu có, else train_loss) ──
+        # ── Save best checkpoint + Early stopping ────────────────────────
         monitor = val_loss if val_loss is not None else avg_train_loss
-        if monitor < best_val_loss:
-            best_val_loss = monitor
+        if monitor < best_val_loss - min_delta:
+            best_val_loss    = monitor
+            epochs_no_improve = 0
             if save_path:
                 _save(student, save_path)
                 print(f"[Stage2] ✓ Best checkpoint saved (loss={best_val_loss:.4f}) → {save_path}")
+        else:
+            epochs_no_improve += 1
+            print(
+                f"[Stage2] No improve {epochs_no_improve}/{patience} "
+                f"(best={best_val_loss:.4f}  current={monitor:.4f})"
+            )
+            if epochs_no_improve >= patience:
+                print(
+                    f"[Stage2] Early stopping tại epoch {epoch+1}. "
+                    f"Best val_loss={best_val_loss:.4f}"
+                )
+                break
 
     # Luôn save final checkpoint
     if save_path:
