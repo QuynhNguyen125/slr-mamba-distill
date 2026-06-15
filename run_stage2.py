@@ -293,9 +293,7 @@ def main():
     wandb_suffix = f"-opt{STAGE2_START_OPTION}"
     if wandb_run is not None:
         # Thêm suffix vào wandb name để phân biệt hai option
-        import wandb as _wandb
-        _wandb.run.name = WANDB_NAME + wandb_suffix
-        _wandb.run.save()
+        wandb_run.name = WANDB_NAME + wandb_suffix
 
     student = train_stage2(
         student=student,
