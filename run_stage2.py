@@ -71,26 +71,39 @@ D_STATE    = 64
 D_CONV     = 3
 CHUNK_SIZE = 16
 
-# ── Stage 2: hidden state alignment (freeze_mlp=True, phi-mamba default) ──
-# freeze_mlp=True: frozen FFN, train temporal SSM + spatial attn
-#   target = pre_ffn_states (phi-mamba: all_attn_outputs)
-FREEZE_MLP = True
+# ── Stage 2: hidden state alignment ─────────────────────────────────
+# freeze_mlp=False: train toàn bộ block (FFN + attn + SSM)
+#   target = block_outputs[l]  (phi-mamba: all_hidden_states[l+1])
+#   = full block output sau cả FFN — alignment hoàn chỉnh hơn
+# freeze_mlp=True (cũ):  target = pre_ffn_states, frozen FFN
+FREEZE_MLP = False
 S2_EPOCHS  = 100   # upper bound — early stopping sẽ dừng sớm khi converge
 S2_LR      = 5e-4
 S2_PATIENCE   = 10     # dừng nếu val_loss không giảm sau N epoch
 S2_MIN_DELTA  = 0.005  # cải thiện tối thiểu để tính là "có tiến bộ"
 
-# ── Resume: tiếp tục từ checkpoint Stage 2 (50 epoch) hay từ Stage 1? ──
-# True  → load student_stage2_50ep.pth  (tiếp tục từ 50 epoch, nhanh hơn)
-# False → load student_stage1.pth       (fresh run từ đầu)
-CONTINUE_FROM_STAGE2 = True
+# ── Lựa chọn khởi điểm cho freeze_mlp=False run ─────────────────────
+#
+#   OPTION 1 — Warm start từ Stage 2 freeze_mlp=True (50 epoch)
+#       → Load: checkpoints/student_stage2_50ep.pth
+#       → FFN weights đã qua Stage 2 (frozen), spatial/temporal attn đã align
+#       → Tiếp tục fine-tune toàn bộ block với target = block_outputs
+#       → Giả thuyết: tận dụng alignment một phần, converge nhanh hơn
+#
+#   OPTION 2 — Fresh start từ Stage 1
+#       → Load: checkpoints/student_stage1.pth  (sau weight transfer + matrix align)
+#       → Bắt đầu hoàn toàn từ đầu với freeze_mlp=False
+#       → Clean comparison: không bị ảnh hưởng bởi Stage 2 freeze_mlp=True
+#       → Thường được khuyến nghị khi freeze_mlp thay đổi
+#
+STAGE2_START_OPTION = 2   # ← đổi thành 1 hoặc 2
 
 LOG_FREQ = 10
 
 # ── Wandb ─────────────────────────────────────────────────────────────
 USE_WANDB     = True
 WANDB_PROJECT = "slr-mamba-distill"
-WANDB_NAME    = "stage2-wlasl100-v4"  # v4: early stopping (patience=10, upper=100ep)
+WANDB_NAME    = "stage2-wlasl100-v5-nofreeze"  # v5: freeze_mlp=False, full block alignment
 
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -218,18 +231,26 @@ def main():
     teacher.to(DEVICE).eval()
     print("Teacher loaded ✓")
 
-    # ── Student — load từ Stage 2 (continue) hoặc Stage 1 (fresh) ───────
-    STAGE2_CKPT = os.path.join(OUTPUT_DIR, "student_stage2_50ep.pth")
-    if CONTINUE_FROM_STAGE2 and os.path.exists(STAGE2_CKPT):
-        student_ckpt = STAGE2_CKPT
-        print(f"\nLoading student từ Stage 2 (continue): {student_ckpt}")
+    # ── Student — load theo STAGE2_START_OPTION ──────────────────────────
+    STAGE2_50EP_CKPT = os.path.join(OUTPUT_DIR, "student_stage2_50ep.pth")
+
+    if STAGE2_START_OPTION == 1:
+        # OPTION 1: Warm start từ Stage 2 freeze_mlp=True (50 epoch)
+        print(f"\n[Option 1] Warm start từ Stage 2 50ep: {STAGE2_50EP_CKPT}")
+        if os.path.exists(STAGE2_50EP_CKPT):
+            student_ckpt = STAGE2_50EP_CKPT
+        else:
+            print(f"[WARN] Không tìm thấy {STAGE2_50EP_CKPT}. Fallback → Option 2.")
+            student_ckpt = STUDENT_STAGE1_CKPT
     else:
+        # OPTION 2: Fresh start từ Stage 1
+        print(f"\n[Option 2] Fresh start từ Stage 1: {STUDENT_STAGE1_CKPT}")
         student_ckpt = STUDENT_STAGE1_CKPT
-        print(f"\nLoading student từ Stage 1 (fresh): {student_ckpt}")
-        if not os.path.exists(student_ckpt):
-            print(f"[ERROR] Stage 1 checkpoint không tồn tại: {student_ckpt}")
-            print("Hãy chạy run_stage1.py trước.")
-            sys.exit(1)
+
+    if not os.path.exists(student_ckpt):
+        print(f"[ERROR] Checkpoint không tồn tại: {student_ckpt}")
+        print("Hãy chạy run_stage1.py trước.")
+        sys.exit(1)
 
     student = BiMambaSLR(
         in_channels=IN_CHANNELS,
@@ -264,7 +285,18 @@ def main():
     print(f"Target  = {target_desc}")
     print(f"Epochs  : {S2_EPOCHS} (upper bound, early stop patience={S2_PATIENCE})  |  LR : {S2_LR}")
 
-    save_name = "student_stage2_best.pth"
+    # Tên file và wandb run phân biệt theo option
+    save_name   = (
+        "student_stage2_best_nofreeze_opt1.pth" if STAGE2_START_OPTION == 1
+        else "student_stage2_best_nofreeze.pth"
+    )
+    wandb_suffix = f"-opt{STAGE2_START_OPTION}"
+    if wandb_run is not None:
+        # Thêm suffix vào wandb name để phân biệt hai option
+        import wandb as _wandb
+        _wandb.run.name = WANDB_NAME + wandb_suffix
+        _wandb.run.save()
+
     student = train_stage2(
         student=student,
         teacher=teacher,
