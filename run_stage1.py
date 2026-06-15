@@ -60,17 +60,18 @@ D_STATE    = 64
 D_CONV     = 3
 CHUNK_SIZE = 16
 
-# ── Stage 1 ───────────────────────────────────────────────────────────
-S1_EPOCHS  = 20
-S1_LR      = 1e-3
-LOG_FREQ   = 10
-VIZ_FREQ   = 2
-VAL_COPIES = 4   # multi-crop validation — match teacher's kcopies=4
+# ── Stage 1: Full Convergence Study ──────────────────────────────────
+S1_EPOCHS         = 100              # upper bound (no early stopping)
+S1_LR             = 1e-3
+LOG_FREQ          = 10
+VAL_COPIES        = 4               # multi-crop validation
+CHECKPOINT_EPOCHS = [10, 25, 50, 100]  # save milestone checkpoints + bar plot
+VIZ_EPOCHS        = [1, 25, 100]       # log matrix heatmap (Figure 3)
 
 # ── Wandb ─────────────────────────────────────────────────────────────
 USE_WANDB     = True
 WANDB_PROJECT = "slr-mamba-distill"
-WANDB_NAME    = "stage1-wlasl100"
+WANDB_NAME    = "stage1-wlasl100-convergence"  # convergence study run
 
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -111,9 +112,14 @@ def main():
                 embedding_dim=EMBEDDING_DIM, n_blocks=N_BLOCKS,
                 n_heads=N_HEADS, d_state=D_STATE, d_conv=D_CONV,
                 s1_epochs=S1_EPOCHS, s1_lr=S1_LR, batch_size=BATCH_SIZE,
+                checkpoint_epochs=CHECKPOINT_EPOCHS,
+                viz_epochs=VIZ_EPOCHS,
             ),
-            settings=wandb.Settings(console="off"),  # tắt wandb console capture
+            settings=wandb.Settings(console="off"),
         )
+        # X axis chung cho tất cả stage1 metrics
+        wandb_run.define_metric("stage1/epoch")
+        wandb_run.define_metric("stage1/*", step_metric="stage1/epoch")
         print(f"Wandb : {wandb_run.url}\n")
 
     # ── Dataset ───────────────────────────────────────────────────────
@@ -216,8 +222,12 @@ def main():
     print("\n=== Weight Transfer: Teacher → Student ===")
     student.load_teacher_weights(teacher)
 
-    # ── Stage 1 ───────────────────────────────────────────────────────
-    print("\n=== Stage 1: Transfer Matrix Alignment ===")
+    # ── Stage 1: Full Convergence Study ──────────────────────────────────
+    print("\n=== Stage 1: Transfer Matrix Alignment — Convergence Study ===")
+    print(f"Epochs          : {S1_EPOCHS} (no early stopping)")
+    print(f"Checkpoint saves: {CHECKPOINT_EPOCHS}")
+    print(f"Matrix viz      : {VIZ_EPOCHS}")
+
     student = train_stage1(
         student=student,
         teacher=teacher,
@@ -227,12 +237,16 @@ def main():
         lr=S1_LR,
         num_epochs=S1_EPOCHS,
         log_freq=LOG_FREQ,
-        viz_freq=VIZ_FREQ,
+        checkpoint_epochs=CHECKPOINT_EPOCHS,
+        viz_epochs=VIZ_EPOCHS,
         wandb_run=wandb_run,
-        save_path=os.path.join(OUTPUT_DIR, "student_stage1.pth"),
+        save_path=os.path.join(OUTPUT_DIR, "student_stage1_best.pth"),
+        save_dir=OUTPUT_DIR,
     )
 
-    print(f"\n✓ Stage 1 xong. Checkpoint: {OUTPUT_DIR}/student_stage1.pth")
+    print(f"\n✓ Stage 1 xong.")
+    print(f"  Best ckpt  : {OUTPUT_DIR}/student_stage1_best.pth")
+    print(f"  Milestones : {OUTPUT_DIR}/student_stage1_ep010/025/050/100.pth")
     if wandb_run is not None:
         wandb_run.finish()
 
