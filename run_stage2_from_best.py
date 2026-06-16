@@ -1,17 +1,14 @@
 """
 Chạy Stage 2: Hidden State Alignment (MOHAWK).
+Version: load từ student_stage1_best.pth (best val_loss từ Stage 1 convergence study).
 
-Theo paper MOHAWK và phi-mamba repo:
-    - 1 phase duy nhất, freeze_mlp=False (full block alignment)
-    - Target = full block output của teacher (phi-mamba: all_hidden_states[l+1])
-    - Loss = ||h_student[l] - h_teacher[l]||_2  per-token L2 norm
-    - Backward per-block để tiết kiệm memory
-
-Tham khảo: phi-mamba/assets/mohawk_stage2.py
-    freeze_mlp = True/False  # "up to training scheme"
+Khác với run_stage2.py:
+    - STUDENT_STAGE1_CKPT = "checkpoints/student_stage1_best.pth"  ← điểm tối ưu Stage 1
+    - WANDB_NAME           = "stage2-wlasl100-v6-best-s1"
+    - save_name            = "student_stage2_best_nofreeze_v6.pth"
 
 Cách dùng:
-    python run_stage2.py
+    CUDA_VISIBLE_DEVICES=1 python run_stage2_from_best.py
 """
 
 import os, sys, warnings, logging
@@ -41,7 +38,9 @@ TEACHER_CKPT = os.path.expanduser(
     "/scripts/outputs/2026-06-04/16-23-19/checkpoints"
     "/epoch=1400-valid_loss=1.1588-valid_accuracy_PI@01=0.8254.ckpt"
 )
+# ← load từ best checkpoint của Stage 1 convergence study (100 epoch)
 STUDENT_STAGE1_CKPT = "checkpoints/student_stage1_best.pth"
+
 SPLIT_FILE = os.path.expanduser("~/slr-mamba-distill/data/splits/splits/asl100.json")
 POSE_ROOT  = os.path.expanduser("~/slr-mamba-distill/data/pose_per_individual_videos")
 SSTAN_SRC  = os.path.expanduser(
@@ -71,39 +70,19 @@ D_STATE    = 64
 D_CONV     = 3
 CHUNK_SIZE = 16
 
-# ── Stage 2: hidden state alignment ─────────────────────────────────
-# freeze_mlp=False: train toàn bộ block (FFN + attn + SSM)
-#   target = block_outputs[l]  (phi-mamba: all_hidden_states[l+1])
-#   = full block output sau cả FFN — alignment hoàn chỉnh hơn
-# freeze_mlp=True (cũ):  target = pre_ffn_states, frozen FFN
-FREEZE_MLP = False
-S2_EPOCHS  = 100   # upper bound — early stopping sẽ dừng sớm khi converge
-S2_LR      = 5e-4
-S2_PATIENCE   = 10     # dừng nếu val_loss không giảm sau N epoch
-S2_MIN_DELTA  = 0.005  # cải thiện tối thiểu để tính là "có tiến bộ"
-
-# ── Lựa chọn khởi điểm cho freeze_mlp=False run ─────────────────────
-#
-#   OPTION 1 — Warm start từ Stage 2 freeze_mlp=True (50 epoch)
-#       → Load: checkpoints/student_stage2_50ep.pth
-#       → FFN weights đã qua Stage 2 (frozen), spatial/temporal attn đã align
-#       → Tiếp tục fine-tune toàn bộ block với target = block_outputs
-#       → Giả thuyết: tận dụng alignment một phần, converge nhanh hơn
-#
-#   OPTION 2 — Fresh start từ Stage 1
-#       → Load: checkpoints/student_stage1.pth  (sau weight transfer + matrix align)
-#       → Bắt đầu hoàn toàn từ đầu với freeze_mlp=False
-#       → Clean comparison: không bị ảnh hưởng bởi Stage 2 freeze_mlp=True
-#       → Thường được khuyến nghị khi freeze_mlp thay đổi
-#
-STAGE2_START_OPTION = 2   # ← đổi thành 1 hoặc 2
+# ── Stage 2: hidden state alignment (freeze_mlp=False, full block) ───
+FREEZE_MLP    = False   # train toàn bộ block, target = block_outputs[l]
+S2_EPOCHS     = 100     # upper bound — early stopping sẽ dừng sớm khi converge
+S2_LR         = 5e-4
+S2_PATIENCE   = 10      # dừng nếu val_loss không giảm sau N epoch
+S2_MIN_DELTA  = 0.005   # cải thiện tối thiểu để tính là "có tiến bộ"
 
 LOG_FREQ = 10
 
 # ── Wandb ─────────────────────────────────────────────────────────────
 USE_WANDB     = True
 WANDB_PROJECT = "slr-mamba-distill"
-WANDB_NAME    = "stage2-wlasl100-v5-nofreeze"  # v5: freeze_mlp=False, full block alignment
+WANDB_NAME    = "stage2-wlasl100-v6-best-s1"  # v6: load từ student_stage1_best.pth
 
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -148,11 +127,10 @@ def main():
                 freeze_mlp=FREEZE_MLP,
                 patience=S2_PATIENCE,
                 min_delta=S2_MIN_DELTA,
+                stage1_ckpt="student_stage1_best.pth",
             ),
             settings=wandb.Settings(console="off"),
         )
-        # Khai báo epoch là X axis cho tất cả stage2 metrics
-        # → tránh lỗi "no data for _step" khi wandb dùng internal step counter
         wandb_run.define_metric("stage2/epoch")
         wandb_run.define_metric("stage2/*", step_metric="stage2/epoch")
         print(f"Wandb : {wandb_run.url}\n")
@@ -231,25 +209,11 @@ def main():
     teacher.to(DEVICE).eval()
     print("Teacher loaded ✓")
 
-    # ── Student — load theo STAGE2_START_OPTION ──────────────────────────
-    STAGE2_50EP_CKPT = os.path.join(OUTPUT_DIR, "student_stage2_50ep.pth")
-
-    if STAGE2_START_OPTION == 1:
-        # OPTION 1: Warm start từ Stage 2 freeze_mlp=True (50 epoch)
-        print(f"\n[Option 1] Warm start từ Stage 2 50ep: {STAGE2_50EP_CKPT}")
-        if os.path.exists(STAGE2_50EP_CKPT):
-            student_ckpt = STAGE2_50EP_CKPT
-        else:
-            print(f"[WARN] Không tìm thấy {STAGE2_50EP_CKPT}. Fallback → Option 2.")
-            student_ckpt = STUDENT_STAGE1_CKPT
-    else:
-        # OPTION 2: Fresh start từ Stage 1
-        print(f"\n[Option 2] Fresh start từ Stage 1: {STUDENT_STAGE1_CKPT}")
-        student_ckpt = STUDENT_STAGE1_CKPT
-
-    if not os.path.exists(student_ckpt):
-        print(f"[ERROR] Checkpoint không tồn tại: {student_ckpt}")
-        print("Hãy chạy run_stage1.py trước.")
+    # ── Student — load từ student_stage1_best.pth ─────────────────────
+    print(f"\nLoading student từ Stage 1 best: {STUDENT_STAGE1_CKPT}")
+    if not os.path.exists(STUDENT_STAGE1_CKPT):
+        print(f"[ERROR] Checkpoint không tồn tại: {STUDENT_STAGE1_CKPT}")
+        print("Hãy chạy run_stage1.py trước (convergence study, 100 epoch).")
         sys.exit(1)
 
     student = BiMambaSLR(
@@ -269,32 +233,20 @@ def main():
         d_conv=D_CONV,
         chunk_size=CHUNK_SIZE,
     )
-    ckpt = torch.load(student_ckpt, map_location=DEVICE, weights_only=False)
+    ckpt = torch.load(STUDENT_STAGE1_CKPT, map_location=DEVICE, weights_only=False)
     student.load_state_dict(ckpt.get("model_state_dict", ckpt))
     total = sum(p.numel() for p in student.parameters())
     print(f"Student params : {total:,}  ✓")
 
-    # ── Stage 2: Hidden state alignment (freeze_mlp=True, phi-mamba default) ──
-    target_desc = (
-        "pre_ffn_states  (phi-mamba: all_attn_outputs)" if FREEZE_MLP
-        else "block_outputs   (phi-mamba: all_hidden_states[l+1])"
-    )
+    # ── Stage 2: Hidden state alignment ──────────────────────────────
     print("\n" + "="*60)
     print(f"=== Stage 2: Hidden State Alignment (freeze_mlp={FREEZE_MLP}) ===")
     print("="*60)
-    print(f"Target  = {target_desc}")
+    print(f"Target  = block_outputs (phi-mamba: all_hidden_states[l+1])")
     print(f"Epochs  : {S2_EPOCHS} (upper bound, early stop patience={S2_PATIENCE})  |  LR : {S2_LR}")
+    print(f"Stage 1 : student_stage1_best.pth  (best val_loss từ 100-epoch run)")
 
-    # Tên file và wandb run phân biệt theo option
-    save_name   = (
-        "student_stage2_best_nofreeze_opt1.pth" if STAGE2_START_OPTION == 1
-        else "student_stage2_best_nofreeze.pth"
-    )
-    wandb_suffix = f"-opt{STAGE2_START_OPTION}"
-    if wandb_run is not None:
-        # Thêm suffix vào wandb name để phân biệt hai option
-        wandb_run.name = WANDB_NAME + wandb_suffix
-
+    save_name = "student_stage2_best_nofreeze_v6.pth"
     student = train_stage2(
         student=student,
         teacher=teacher,
