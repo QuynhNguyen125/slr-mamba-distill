@@ -42,7 +42,7 @@ TEACHER_CKPT = os.path.expanduser(
     "/scripts/outputs/2026-06-04/16-23-19/checkpoints"
     "/epoch=1400-valid_loss=1.1588-valid_accuracy_PI@01=0.8254.ckpt"
 )
-STUDENT_STAGE2_CKPT = "checkpoints/student_stage2.pth"
+STUDENT_STAGE2_CKPT = "checkpoints/student_stage2_best_nofreeze_v6.pth"  # wandb: stage2-wlasl100-v6-best-s1
 SPLIT_FILE = os.path.expanduser("~/slr-mamba-distill/data/splits/splits/asl100.json")
 POSE_ROOT  = os.path.expanduser("~/slr-mamba-distill/data/pose_per_individual_videos")
 SSTAN_SRC  = os.path.expanduser(
@@ -87,7 +87,7 @@ LOG_FREQ = 10
 # ── Wandb ─────────────────────────────────────────────────────────────
 USE_WANDB     = True
 WANDB_PROJECT = "slr-mamba-distill"
-WANDB_NAME    = "stage3-wlasl100-v3"  # v3: stage2 30 epoch freeze_mlp=True + epochs=100 + early_stop
+WANDB_NAME    = "stage3-wlasl100-v4-from-s2v6"  # v4: stage2 ckpt = v6-best-s1 (freeze_mlp=False, full-block target)
 
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

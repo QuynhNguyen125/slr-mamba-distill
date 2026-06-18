@@ -102,10 +102,14 @@ def train_stage3(
       Phase B (còn lại):        train toàn bộ với KL + CE → full distillation
 
     Lý do cần Phase A:
-      - fc bị freeze suốt Stage 1 và 2 → random weights
+      - fc KHÔNG random — load_teacher_weights() đã copy + freeze fc từ teacher
+        trước Stage 1 (xem models/student.py). Nhưng fc đó được train cho
+        feature distribution của teacher (spatial attention + temporal attention);
+        sau khi temporal attention bị thay bằng BiMamba2 (Stage 1+2), feature
+        distribution đầu vào fc đã lệch khỏi cái fc "biết" → fc cần recalibrate.
       - BiMamba2 collapse → temporal ≈ 0
       - Nếu train toàn bộ ngay từ đầu, gradient qua 10 blocks near-identity
-        không đủ để fc học phân loại → val_acc < 1% (random)
+        không đủ để fc recalibrate kịp → val_acc < 1% (random)
     """
     teacher.eval()
     teacher.to(device)
