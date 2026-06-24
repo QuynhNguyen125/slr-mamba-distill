@@ -54,8 +54,11 @@ OUTPUT_DIR = "checkpoints"
 SEQ_LEN     = 50
 N_JOINTS    = 55
 IN_CHANNELS = 2
-BATCH_SIZE  = 2    # Stage 3: teacher+student+full graph → memory cao, dùng GRAD_ACCUM
-GRAD_ACCUM  = 4    # Effective batch = BATCH_SIZE * GRAD_ACCUM = 8
+# REBUILD: bf16 autocast (stage3_finetune.py) giảm memory đáng kể → tăng
+# BATCH_SIZE từ 2 lên 4 để BN có nhiều sample/forward-pass hơn (ổn định hơn).
+# Nếu vẫn OOM trên GPU thực tế, hạ về 2 nhưng KHÔNG hạ S3_LR (xem ghi chú dưới).
+BATCH_SIZE  = 4
+GRAD_ACCUM  = 4    # Effective batch = BATCH_SIZE * GRAD_ACCUM = 16
 NUM_WORKERS = 4
 VAL_COPIES  = 4
 
@@ -76,18 +79,22 @@ CHUNK_SIZE = 16
 # ── Stage 3 ───────────────────────────────────────────────────────────
 S3_EPOCHS      = 100      # tổng = Phase A + Phase B (teacher train 1500 epoch → cần đủ)
 S3_PHASE_A     = 10       # Phase A: train fc only (CE) → khởi động classifier
-S3_LR          = 1e-4    # LR Phase B; Phase A dùng lr*5
+# REBUILD FIX: trước đây stage3_finetune.py dùng lr*0.1 cho Phase B → LR thực
+# tế chỉ 1e-5, quá nhỏ so với paper Appendix A.1 (Stage 3 LR ổn định ~2e-4,
+# 5e-4 ban đầu nhưng unstable). Code đã sửa để dùng `lr` trực tiếp cho Phase B
+# (không còn *0.1) → đặt S3_LR = giá trị Phase B thật, theo paper.
+S3_LR          = 2e-4    # LR Phase B (paper-aligned); Phase A dùng lr*5
 ALPHA          = 0.5     # weight KL loss; 1-ALPHA = weight CE
 TEMPERATURE    = 4.0     # distillation temperature (Hinton et al.)
-GRAD_ACCUM     = 4       # effective batch = BATCH_SIZE * GRAD_ACCUM = 2 * 4 = 8
-PATIENCE       = 15       # early stopping Phase B: dừng nếu val_acc không tăng sau N epoch
+GRAD_ACCUM     = 4       # effective batch = BATCH_SIZE * GRAD_ACCUM = 4 * 4 = 16
+PATIENCE       = 15       # early stopping Phase B: dừng nếu val_acc không tăng (strict >, MIN_DELTA) sau N epoch
 
 LOG_FREQ = 10
 
 # ── Wandb ─────────────────────────────────────────────────────────────
 USE_WANDB     = True
 WANDB_PROJECT = "slr-mamba-distill"
-WANDB_NAME    = "stage3-wlasl100-v4-from-s2v6"  # v4: stage2 ckpt = v6-best-s1 (freeze_mlp=False, full-block target)
+WANDB_NAME    = "stage3-wlasl100-v5-rebuild"  # v5: rebuild — fix LR/wd/clip, BN recalib, spike-revert, early-stop, bf16
 
 SEED   = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

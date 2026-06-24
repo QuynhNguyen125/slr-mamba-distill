@@ -18,9 +18,31 @@ Logs to wandb (X axis = stage3/epoch, khai báo bằng define_metric):
     stage3/val_loss     — val combined loss
     stage3/val_acc      — top-1 accuracy trên val (k_copies multi-crop)
     stage3/lr
+
+REBUILD NOTES (2026-06-24) — sau khi val_acc stuck ~random-chance, val_loss
+nổ lên >800 ngay khi Phase B bắt đầu:
+    1. Phase B LR thực tế trước đây = lr*0.1 = 1e-5 (quá nhỏ so với paper
+       Appendix A.1: Stage 3 dùng LR ổn định ~2e-4) → model gần như không học
+       (train_kl/train_ce flatline suốt Phase B). Fix: dùng `lr` trực tiếp,
+       caller (run_stage3.py) truyền giá trị paper-aligned.
+    2. weight_decay 0.01 → 0.1, grad_clip 0.5 → 1.0 (khớp paper Appendix A.1).
+    3. Early-stopping dùng `>=` khiến mọi tie tính là "cải thiện" → patience
+       không tích lũy được trong lúc val_acc dao động noise quanh random
+       chance → train hết 90 epoch vô ích. Fix: strict `>` + MIN_DELTA.
+    4. Thêm BN recalibration (forward-only, no backward) ngay khi chuyển
+       Phase A → Phase B, vì backbone vừa unfreeze làm activation distribution
+       lệch khỏi distribution mà BN running stats (momentum=0.01) đã hội tụ.
+    5. Thêm spike-revert: nếu val_loss > 3x best_val_loss → load lại best
+       checkpoint (in-memory) + giảm nửa LR, mirror đúng cách paper Section 5.2
+       mô tả xử lý Stage 3 loss spikes ("checkpointing, weight decay, and
+       gradient clipping").
+    6. Forward pass dùng bf16 autocast (paper dùng bf16 cho mọi stage) — giảm
+       memory, cho phép tăng BATCH_SIZE (xem run_stage3.py).
 """
 
 import os
+import copy
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -29,6 +51,21 @@ from torch.utils.data import DataLoader
 from models.student import BiMambaSLR
 from models.teacher import TeacherModel
 from distillation.losses import combined_stage3_loss, kl_distillation_loss, classification_loss
+
+# Min cải thiện để tính là "tốt hơn" — tránh early-stop bị noise của val_acc
+# (oscillation random) làm vô hiệu hoá patience (xem REBUILD NOTES cuối file).
+MIN_DELTA = 1e-4
+
+# Hệ số phát hiện loss-spike: nếu val_loss > SPIKE_FACTOR * best_val_loss → revert.
+# Theo paper MOHAWK Section 5.2: Stage 3 có loss spikes (instability) đã biết,
+# tác giả khắc phục bằng "checkpointing, weight decay, and gradient clipping".
+SPIKE_FACTOR = 3.0
+
+
+def _autocast_ctx(device):
+    """bf16 autocast — theo paper (Appendix A.1: 'bf16 mixed precision' mọi stage)."""
+    device_type = "cuda" if "cuda" in str(device) else "cpu"
+    return torch.autocast(device_type=device_type, dtype=torch.bfloat16)
 
 
 def _sanitize_bn_buffers(model: nn.Module):
@@ -57,6 +94,34 @@ def set_stage3_trainable(student: BiMambaSLR):
     """
     for param in student.parameters():
         param.requires_grad_(True)
+
+
+@torch.no_grad()
+def _recalibrate_bn(student: BiMambaSLR, dataloader: DataLoader, device: str, num_batches: int = 30):
+    """
+    Forward-only pass (no backward) để "làm nóng" lại BN running stats trước khi
+    chuyển sang Phase B.
+
+    Lý do cần bước này:
+      - Phase A chỉ train fc → backbone weights cố định, nhưng BN running stats
+        vẫn được cập nhật (student.train() bật BN train-mode cho TOÀN MODEL).
+      - Khi Phase B bắt đầu, set_stage3_trainable() mở khoá toàn bộ backbone
+        → forward-pass activation distribution có thể lệch khỏi distribution mà
+        BN running stats (momentum=0.01, rất chậm) đã hội tụ tới trong Phase A.
+      - Nếu không recalibrate, vài epoch đầu Phase B dùng eval-mode running stats
+        SAI lệch → val_loss/val_acc nhiễu mạnh ngay từ đầu Phase B (đúng như quan
+        sát trong wandb: val_loss bắt đầu leo thang ngay tại epoch chuyển phase).
+    """
+    student.train()
+    n = 0
+    for batch in dataloader:
+        if n >= num_batches:
+            break
+        x, _ = _get_x_labels(batch, device)
+        with _autocast_ctx(device):
+            student(x)
+        n += 1
+    print(f"[Stage3-B] BN recalibration: {n} forward batches (no backward)")
 
 
 @torch.no_grad()
@@ -151,7 +216,8 @@ def train_stage3(
             #   → loss.backward() raise RuntimeError (không có gradient)
             # - PyTorch đủ thông minh: backward chỉ tính grad cho fc params,
             #   không đi qua backbone (backbone output có requires_grad=False)
-            student_logits = student(x)
+            with _autocast_ctx(device):
+                student_logits = student(x)
 
             # Chỉ CE loss
             ce   = classification_loss(student_logits, labels)
@@ -218,9 +284,17 @@ def train_stage3(
     set_stage3_trainable(student)
     student.train()
 
-    import math
+    # BN recalibration: backbone vừa được unfreeze, running stats của Phase A
+    # (chỉ phản ánh frozen-backbone activations) không còn đúng nữa.
+    _recalibrate_bn(student, dataloader, device, num_batches=30)
+    student.train()
+
     WARMUP_EPOCHS = 2
-    opt_b = optim.AdamW(student.parameters(), lr=lr * 0.1, weight_decay=0.01)
+    # REBUILD FIX: paper (Appendix A.1) dùng LR ổn định ~2e-4 cho Stage 3 và
+    # weight_decay=0.1. Bản cũ dùng lr*0.1 (→ 1e-5 thực tế) + wd=0.01: LR quá
+    # nhỏ khiến model gần như không học (train_kl/ce flatline suốt Phase B).
+    # Caller (run_stage3.py) truyền `lr` = LR thực tế muốn dùng cho Phase B.
+    opt_b = optim.AdamW(student.parameters(), lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
 
     def lr_lambda(epoch):
         if epoch < WARMUP_EPOCHS:
@@ -237,6 +311,11 @@ def train_stage3(
     epoch_offset = phase_a_epochs   # offset cho wandb epoch axis
     epochs_no_improve = 0           # early stopping counter
 
+    # Spike-revert state (paper Section 5.2: "addressed using checkpointing,
+    # weight decay, and gradient clipping" để xử lý loss spikes ở Stage 3).
+    best_val_loss = float("inf")
+    best_state_dict = None
+
     for epoch in range(phase_b_epochs):
         student.train()
         epoch_loss = epoch_kl = epoch_ce = 0.0
@@ -248,10 +327,11 @@ def train_stage3(
         for step, batch in enumerate(dataloader):
             x, labels = _get_x_labels(batch, device)
 
-            with torch.no_grad():
+            with torch.no_grad(), _autocast_ctx(device):
                 teacher_logits = teacher(x)["logits"]
 
-            student_logits = student(x)
+            with _autocast_ctx(device):
+                student_logits = student(x)
 
             if torch.isnan(student_logits).any() or torch.isinf(student_logits).any():
                 nan_batches += 1
@@ -276,7 +356,10 @@ def train_stage3(
                 epoch_total   += tgts.size(0)
 
             if (step + 1) % grad_accum == 0 or (step + 1) == len(dataloader):
-                torch.nn.utils.clip_grad_norm_(student.parameters(), 0.5)
+                # REBUILD FIX: paper Appendix A.1 dùng grad-clip=1.0 cho mọi stage,
+                # không phải 0.5 — clip quá chặt + LR quá nhỏ (bug cũ) cộng hưởng
+                # khiến model gần như không di chuyển trong suốt Phase B.
+                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
                 opt_b.step()
                 opt_b.zero_grad()
                 _sanitize_bn_buffers(student)
@@ -304,6 +387,27 @@ def train_stage3(
                 student, teacher, val_dataloader, device, alpha, temperature
             )
 
+            # ── Spike-revert (paper Section 5.2 mitigation: "checkpointing") ──
+            # Nếu val_loss nổ lên > SPIKE_FACTOR x best_val_loss → coi epoch này
+            # là 1 loss spike, revert về best checkpoint trong memory + giảm nửa LR
+            # thay vì để model tiếp tục train từ trạng thái đã hỏng.
+            if val_loss == val_loss and val_loss != float("inf"):  # not NaN
+                if best_state_dict is not None and val_loss > SPIKE_FACTOR * best_val_loss:
+                    student.load_state_dict(best_state_dict)
+                    for g in opt_b.param_groups:
+                        g["lr"] *= 0.5
+                    print(
+                        f"[Stage3-B] ⚠ Loss spike phát hiện (val_loss={val_loss:.4f} > "
+                        f"{SPIKE_FACTOR}x best={best_val_loss:.4f}) → revert checkpoint, "
+                        f"giảm nửa LR (now {opt_b.param_groups[0]['lr']:.2e})"
+                    )
+                    student.train()
+                    continue  # bỏ qua phần log/checkpoint của epoch bị revert
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state_dict = copy.deepcopy(student.state_dict())
+
         val_str = ""
         if val_loss is not None:
             val_str = f"  val_loss: {val_loss:.4f}  val_acc: {val_acc*100:.2f}%"
@@ -329,8 +433,12 @@ def train_stage3(
                 log_dict["stage3/val_acc"]  = val_acc
             wandb_run.log(log_dict)
 
+        # REBUILD FIX: `>=` coi mọi tie là "cải thiện" → với val_acc dao động
+        # ngẫu nhiên quanh random-chance, patience counter gần như không bao giờ
+        # tích lũy → early stopping vô hiệu (chạy hết 90 epoch dù không học được
+        # gì, đúng như log thực tế). Dùng strict `>` + MIN_DELTA.
         monitor = val_acc if val_acc is not None else train_acc
-        if monitor >= best_val_acc:
+        if monitor > best_val_acc + MIN_DELTA:
             best_val_acc = monitor
             epochs_no_improve = 0
             if save_path:
@@ -376,11 +484,12 @@ def _compute_val_metrics(student, teacher, val_loader, device, alpha, temperatur
         # k_copies reshape
         x_clips, k_copies = _maybe_reshape_kcopies(x, seq_len)
 
-        # Teacher logits
-        teacher_logits_clips = teacher(x_clips)["logits"]  # (B*k, C)
+        with _autocast_ctx(device):
+            # Teacher logits
+            teacher_logits_clips = teacher(x_clips)["logits"]  # (B*k, C)
 
-        # Student logits
-        student_logits_clips = student(x_clips)             # (B*k, C)
+            # Student logits
+            student_logits_clips = student(x_clips)             # (B*k, C)
 
         # NaN guard: nếu student logits có NaN/Inf → BN stats chưa hội tụ
         # Skip batch này cho loss; accuracy vẫn dùng nan_to_num để đếm đúng/sai
