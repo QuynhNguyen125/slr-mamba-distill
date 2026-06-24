@@ -329,6 +329,16 @@ def train_stage3(
     # được dùng làm baseline.
     best_val_loss = float("inf")
     best_state_dict = None
+    # BUG FIX 2: LambdaLR.step() tính lại lr = base_lr_GỐC * lr_lambda(epoch)
+    # mỗi lần gọi — không biết gì về việc ta vừa chỉnh tay param_groups["lr"]
+    # khi revert. Hậu quả: lần giảm-nửa-LR ở dòng revert chỉ có hiệu lực đúng
+    # 1 epoch; ngay sched_b.step() kế tiếp sẽ ghi đè lr về gần giá trị cosine
+    # gốc (~lr ban đầu) — model lại spike, lại revert... vòng lặp không bao
+    # giờ ra khỏi vùng bị bất ổn (giải thích vì sao toàn bộ Phase B có thể bị
+    # revert liên tiếp và "biến mất" khỏi wandb, để lại đúng 10 epoch Phase A).
+    # FIX: dùng lr_scale tích lũy, áp lại SAU mỗi sched_b.step() để việc giảm
+    # LR thực sự "dính" qua các epoch sau, không bị cosine schedule xóa.
+    lr_scale = 1.0
     if val_dataloader is not None:
         seed_val_loss, seed_val_acc = _compute_val_metrics(
             student, teacher, val_dataloader, device, alpha, temperature
@@ -398,6 +408,12 @@ def train_stage3(
                 )
 
         sched_b.step()
+        # Re-áp lr_scale tích lũy NGAY SAU sched_b.step() — nếu không, lần
+        # giảm-nửa-LR ở revert epoch trước sẽ bị schedule ghi đè mất (xem
+        # giải thích ở chỗ khởi tạo lr_scale).
+        if lr_scale != 1.0:
+            for g in opt_b.param_groups:
+                g["lr"] *= lr_scale
         nan_batches_total += nan_batches
 
         n_valid   = max(len(dataloader) - nan_batches, 1)
@@ -419,6 +435,7 @@ def train_stage3(
             if val_loss == val_loss and val_loss != float("inf"):  # not NaN
                 if best_state_dict is not None and val_loss > SPIKE_FACTOR * best_val_loss:
                     student.load_state_dict(best_state_dict)
+                    lr_scale *= 0.5   # tích lũy — sẽ được re-áp sau mỗi sched_b.step()
                     for g in opt_b.param_groups:
                         g["lr"] *= 0.5
                     print(
