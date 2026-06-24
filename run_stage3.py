@@ -83,7 +83,10 @@ S3_PHASE_A     = 10       # Phase A: train fc only (CE) → khởi động class
 # tế chỉ 1e-5, quá nhỏ so với paper Appendix A.1 (Stage 3 LR ổn định ~2e-4,
 # 5e-4 ban đầu nhưng unstable). Code đã sửa để dùng `lr` trực tiếp cho Phase B
 # (không còn *0.1) → đặt S3_LR = giá trị Phase B thật, theo paper.
-S3_LR          = 2e-4    # LR Phase B (paper-aligned); Phase A dùng lr*5
+S3_LR          = 1e-4    # LR Phase B (giảm từ 2e-4: effective batch=16 quá nhỏ so với
+                          # batch paper dùng cho Stage 3 (~0.5M) → cùng LR "ổn định" của
+                          # paper vẫn spike ở batch nhỏ này, hạ thêm 1 nấc trước khi thử
+                          # tăng GRAD_ACCUM). Phase A dùng lr*5
 ALPHA          = 0.5     # weight KL loss; 1-ALPHA = weight CE
 TEMPERATURE    = 4.0     # distillation temperature (Hinton et al.)
 GRAD_ACCUM     = 4       # effective batch = BATCH_SIZE * GRAD_ACCUM = 4 * 4 = 16

@@ -265,6 +265,7 @@ def train_stage3(
                 "stage3/train_acc":  train_acc,
                 "stage3/lr":         opt_a.param_groups[0]["lr"],
                 "stage3/phase":      0,   # 0 = Phase A
+                "stage3/reverted":   0,
             }
             if val_dataloader is not None:
                 log["stage3/val_loss"] = val_loss_a
@@ -434,6 +435,7 @@ def train_stage3(
             # thay vì để model tiếp tục train từ trạng thái đã hỏng.
             if val_loss == val_loss and val_loss != float("inf"):  # not NaN
                 if best_state_dict is not None and val_loss > SPIKE_FACTOR * best_val_loss:
+                    spike_val_loss = val_loss   # giá trị spike TRƯỚC khi revert — log lại để thấy trên wandb
                     student.load_state_dict(best_state_dict)
                     lr_scale *= 0.5   # tích lũy — sẽ được re-áp sau mỗi sched_b.step()
                     for g in opt_b.param_groups:
@@ -444,7 +446,26 @@ def train_stage3(
                         f"giảm nửa LR (now {opt_b.param_groups[0]['lr']:.2e})"
                     )
                     student.train()
-                    continue  # bỏ qua phần log/checkpoint của epoch bị revert
+                    # FIX: vẫn log epoch bị revert (đánh dấu stage3/reverted=1) thay vì
+                    # "im lặng" hoàn toàn — nếu không, mọi chart (kể cả stage3/lr) sẽ
+                    # mất sạch dữ liệu Phase B trong lúc đang spike liên tục, khiến
+                    # nhìn vào wandb như thể Phase B chưa từng chạy. Log train metrics
+                    # của epoch này (đã tính xong ở trên) + val_loss spike + lr MỚI
+                    # (sau khi giảm nửa) để thấy rõ phản ứng spike-revert theo thời gian.
+                    if wandb_run is not None:
+                        wandb_run.log({
+                            "stage3/epoch":      epoch_offset + epoch + 1,
+                            "stage3/train_loss": avg_loss,
+                            "stage3/train_kl":   avg_kl,
+                            "stage3/train_ce":   avg_ce,
+                            "stage3/train_acc":  train_acc,
+                            "stage3/lr":         opt_b.param_groups[0]["lr"],
+                            "stage3/phase":      1,
+                            "stage3/val_loss":   spike_val_loss,
+                            "stage3/val_acc":    val_acc,
+                            "stage3/reverted":   1,   # đánh dấu để filter/tô màu riêng trên wandb
+                        })
+                    continue  # bỏ qua phần save-checkpoint/early-stop của epoch bị revert
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -469,6 +490,7 @@ def train_stage3(
                 "stage3/train_acc":  train_acc,
                 "stage3/lr":         opt_b.param_groups[0]["lr"],
                 "stage3/phase":      1,   # 1 = Phase B
+                "stage3/reverted":   0,   # epoch hợp lệ, không bị spike-revert
             }
             if val_loss is not None:
                 log_dict["stage3/val_loss"] = val_loss

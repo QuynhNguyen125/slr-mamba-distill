@@ -81,7 +81,8 @@ CHUNK_SIZE = 16
 # ── Stage 3 (giống run_stage3.py — cùng hyperparam để so sánh công bằng) ──
 S3_EPOCHS      = 100
 S3_PHASE_A     = 10
-S3_LR          = 2e-4
+S3_LR          = 1e-4    # giảm từ 2e-4, đồng bộ với run_stage3.py (effective batch=16 quá nhỏ
+                          # so với batch paper Stage 3 ~0.5M → spike ở LR 2e-4)
 ALPHA          = 0.5
 TEMPERATURE    = 4.0
 GRAD_ACCUM     = 4
