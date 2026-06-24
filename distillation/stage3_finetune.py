@@ -313,8 +313,33 @@ def train_stage3(
 
     # Spike-revert state (paper Section 5.2: "addressed using checkpointing,
     # weight decay, and gradient clipping" để xử lý loss spikes ở Stage 3).
+    #
+    # BUG FIX (đã quan sát qua wandb): khởi tạo best_val_loss=inf / best_state=None
+    # khiến epoch B đầu tiên (epoch 11 global) KHÔNG có gì để revert (guard
+    # `best_state_dict is not None`) → val_loss của epoch đó, dù đã tệ hơn hẳn
+    # so với Phase A (~100-150), vẫn được "chấp nhận" làm best_val_loss đầu tiên
+    # của Phase B. Mọi spike-check sau đó (epoch 12, 13, ...) bị so với baseline
+    # đã hỏng này → ngưỡng 3x trở nên vô nghĩa, spike-revert không bao giờ trigger
+    # đúng lúc (khớp với việc val_loss tiếp tục leo lên ~3000 mà không có epoch
+    # nào "biến mất" khỏi wandb — dấu hiệu của continue/revert thực sự xảy ra).
+    #
+    # FIX: seed best_val_loss/best_state_dict bằng trạng thái NGAY SAU BN
+    # recalibration (tức là điểm bắt đầu thật của Phase B), không phải inf.
+    # Nhờ vậy nếu epoch 11 đã tệ, nó sẽ bị phát hiện + revert ngay, thay vì
+    # được dùng làm baseline.
     best_val_loss = float("inf")
     best_state_dict = None
+    if val_dataloader is not None:
+        seed_val_loss, seed_val_acc = _compute_val_metrics(
+            student, teacher, val_dataloader, device, alpha, temperature
+        )
+        if seed_val_loss == seed_val_loss and seed_val_loss != float("inf"):
+            best_val_loss = seed_val_loss
+            best_state_dict = copy.deepcopy(student.state_dict())
+            print(
+                f"[Stage3-B] Seeded spike-revert baseline (post-BN-recalib): "
+                f"val_loss={seed_val_loss:.4f}  val_acc={seed_val_acc*100:.2f}%"
+            )
 
     for epoch in range(phase_b_epochs):
         student.train()
