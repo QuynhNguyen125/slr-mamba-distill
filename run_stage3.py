@@ -82,7 +82,13 @@ CHUNK_SIZE = 16
 
 # ── Stage 3 ───────────────────────────────────────────────────────────
 S3_EPOCHS      = 100      # tổng = Phase A + Phase B (teacher train 1500 epoch → cần đủ)
-S3_PHASE_A     = 10       # Phase A: train fc only (CE) → khởi động classifier
+S3_PHASE_A     = 20       # Phase A: train fc only (CE) → khởi động classifier.
+                          # Đây là TRẦN (max), không còn là số cố định: code
+                          # (stage3_finetune.py) tự dừng sớm khi val_acc hết cải
+                          # thiện (patience riêng cho Phase A) — đặt trần cao hơn
+                          # 10→20 để không cắt ngang khi val dao động mạnh chưa
+                          # rõ xu hướng converge ở epoch 8-10. Epoch dư ra (nếu
+                          # dừng sớm) tự dồn vào Phase B trong cùng budget S3_EPOCHS.
 # REBUILD FIX: trước đây stage3_finetune.py dùng lr*0.1 cho Phase B → LR thực
 # tế chỉ 1e-5, quá nhỏ so với paper Appendix A.1 (Stage 3 LR ổn định ~2e-4,
 # 5e-4 ban đầu nhưng unstable). Code đã sửa để dùng `lr` trực tiếp cho Phase B
@@ -324,8 +330,8 @@ def main():
     print("=== Stage 3: Full Distillation (KL + CE) ===")
     print("="*60)
     print(f"Loss = {ALPHA} * KL(T={TEMPERATURE}) + {1-ALPHA} * CE")
-    print(f"Phase A: {S3_PHASE_A} epochs, fc only, CE loss  (fc chưa được train qua Stage 1+2)")
-    print(f"Phase B: {S3_EPOCHS - S3_PHASE_A} epochs, full KL+CE  (early stop patience={PATIENCE})")
+    print(f"Phase A: tối đa {S3_PHASE_A} epochs (tự dừng sớm nếu val_acc hết cải thiện), fc only, CE loss")
+    print(f"Phase B: phần epoch còn lại trong tổng {S3_EPOCHS}, full KL+CE  (early stop patience={PATIENCE})")
     print(f"Epochs : {S3_EPOCHS}  |  LR : {S3_LR}")
     print(f"Target : val_acc ≈ teacher ({82.54}%)")
 

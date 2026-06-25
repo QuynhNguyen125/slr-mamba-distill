@@ -74,6 +74,18 @@ MIN_LR_SCALE = 0.1   # LR không bao giờ thấp hơn 10% giá trị ban đầu
 # dừng sớm để tránh lãng phí epoch, thay vì lặp vô ích đến hết patience.
 MAX_CONSECUTIVE_REVERTS = 8
 
+# ADAPTIVE PHASE A: trước đây phase_a_epochs là số epoch CỐ ĐỊNH, cosine
+# schedule (T_max=phase_a_epochs) ép LR về ~0 đúng tại epoch cuối bất kể fc đã
+# converge hay chưa. Quan sát thực tế: val_loss/val_acc Phase A dao động mạnh,
+# không có xu hướng rõ ràng quanh epoch 8-10 → không có cách nào biết 10 epoch
+# là đủ, thiếu, hay dư chỉ bằng cách đoán số cố định.
+# Fix: coi phase_a_epochs là TRẦN (max), dừng sớm khi best_val_acc không cải
+# thiện (> MIN_DELTA) sau PHASE_A_PATIENCE epoch liên tiếp — nhưng chỉ được
+# dừng sớm sau khi đã chạy ít nhất PHASE_A_MIN_EPOCHS (tránh dừng vì dao động
+# nhiễu ngẫu nhiên ở vài epoch đầu, trước khi có đủ dữ liệu để thấy xu hướng).
+PHASE_A_MIN_EPOCHS = 5
+PHASE_A_PATIENCE    = 3
+
 
 def _autocast_ctx(device):
     """bf16 autocast — theo paper (Appendix A.1: 'bf16 mixed precision' mọi stage)."""
@@ -213,6 +225,11 @@ def train_stage3(
     )
     sched_a = optim.lr_scheduler.CosineAnnealingLR(opt_a, T_max=phase_a_epochs)
 
+    # ADAPTIVE PHASE A state — xem ghi chú PHASE_A_MIN_EPOCHS/PATIENCE ở đầu file.
+    best_val_acc_a       = -1.0   # best riêng cho patience-tracking của Phase A
+    phaseA_no_improve    = 0
+    actual_phase_a_epochs = phase_a_epochs   # cập nhật nếu dừng sớm (xem cuối loop)
+
     for epoch in range(phase_a_epochs):
         student.train()
         epoch_ce = 0.0
@@ -285,12 +302,39 @@ def train_stage3(
                 log["stage3/val_acc"]  = val_acc_a
             wandb_run.log(log)
 
-    print(f"\n[PhaseA] Done. Best val_acc so far: {best_val_acc*100:.2f}%")
+        # ADAPTIVE PHASE A early-stop: chỉ áp dụng nếu có val_dataloader (cần
+        # val_acc_a để đánh giá convergence). best_val_acc_a dùng best-so-far
+        # (không phải epoch cuối) nên không bị "đánh lừa" bởi 1 epoch dao động
+        # ngẫu nhiên tăng rồi lại giảm — chỉ dừng khi THỰC SỰ không cải thiện
+        # liên tiếp nhiều epoch.
+        if val_dataloader is not None:
+            if val_acc_a > best_val_acc_a + MIN_DELTA:
+                best_val_acc_a    = val_acc_a
+                phaseA_no_improve = 0
+            else:
+                phaseA_no_improve += 1
+
+            if (epoch + 1) >= PHASE_A_MIN_EPOCHS and phaseA_no_improve >= PHASE_A_PATIENCE:
+                actual_phase_a_epochs = epoch + 1
+                print(
+                    f"[PhaseA] ⏹ Dừng sớm tại epoch {actual_phase_a_epochs}/{phase_a_epochs}: "
+                    f"val_acc không cải thiện (>{MIN_DELTA}) trong {phaseA_no_improve} epoch "
+                    f"liên tiếp (best={best_val_acc_a*100:.2f}%) → fc coi như đã converge."
+                )
+                break
+
+    print(
+        f"\n[PhaseA] Done sau {actual_phase_a_epochs} epoch "
+        f"(trần={phase_a_epochs}). Best val_acc so far: {best_val_acc*100:.2f}%"
+    )
 
     # ══════════════════════════════════════════════════════════════════
     # Phase B: full distillation KL + CE, all params
     # ══════════════════════════════════════════════════════════════════
-    phase_b_epochs = num_epochs - phase_a_epochs
+    # Dùng actual_phase_a_epochs (không phải phase_a_epochs/trần) — nếu Phase A
+    # dừng sớm, phần epoch còn lại được dồn cho Phase B trong cùng budget
+    # num_epochs, thay vì mất luôn số epoch chưa dùng.
+    phase_b_epochs = num_epochs - actual_phase_a_epochs
     print(f"\n{'='*60}")
     print(f"Phase B: Full distillation ({phase_b_epochs} epochs, KL + CE)")
     print(f"{'='*60}")
@@ -322,7 +366,7 @@ def train_stage3(
     print(f"[Stage3-B] Trainable: {trainable:,}  alpha={alpha}  T={temperature}  lr={lr}")
     print(f"[Stage3-B] grad_accum={grad_accum}  warmup={WARMUP_EPOCHS}  patience={patience}")
 
-    epoch_offset = phase_a_epochs   # offset cho wandb epoch axis
+    epoch_offset = actual_phase_a_epochs   # offset cho wandb epoch axis
     epochs_no_improve = 0           # early stopping counter
 
     # Spike-revert state (paper Section 5.2: "addressed using checkpointing,

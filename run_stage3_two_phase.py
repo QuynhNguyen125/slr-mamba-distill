@@ -81,7 +81,9 @@ CHUNK_SIZE = 16
 
 # ── Stage 3 (giống run_stage3.py — cùng hyperparam để so sánh công bằng) ──
 S3_EPOCHS      = 100
-S3_PHASE_A     = 10
+S3_PHASE_A     = 20       # Trần (max) — xem ghi chú run_stage3.py: Phase A giờ
+                          # tự dừng sớm khi val_acc hết cải thiện, trần 20 chỉ để
+                          # không cắt ngang sớm khi val còn dao động mạnh.
 S3_LR          = 1e-4    # giảm từ 2e-4, đồng bộ với run_stage3.py (effective batch=16 quá nhỏ
                           # so với batch paper Stage 3 ~0.5M → spike ở LR 2e-4)
 ALPHA          = 0.5
@@ -309,8 +311,8 @@ def main():
     print("=== Stage 3 (input: Stage 2 two-phase): Full Distillation (KL + CE) ===")
     print("="*60)
     print(f"Loss = {ALPHA} * KL(T={TEMPERATURE}) + {1-ALPHA} * CE")
-    print(f"Phase A: {S3_PHASE_A} epochs, fc only, CE loss")
-    print(f"Phase B: {S3_EPOCHS - S3_PHASE_A} epochs, full KL+CE  (early stop patience={PATIENCE})")
+    print(f"Phase A: tối đa {S3_PHASE_A} epochs (tự dừng sớm nếu val_acc hết cải thiện), fc only, CE loss")
+    print(f"Phase B: phần epoch còn lại trong tổng {S3_EPOCHS}, full KL+CE  (early stop patience={PATIENCE})")
     print(f"Epochs : {S3_EPOCHS}  |  LR : {S3_LR}")
     print(f"Target : val_acc ≈ teacher ({82.54}%)")
 
