@@ -249,8 +249,9 @@ def train_stage3(
             with _autocast_ctx(device):
                 student_logits = student(x)
 
-            # Chỉ CE loss
-            ce   = classification_loss(student_logits, labels)
+            # Chỉ CE loss — ép fp32 cho nhất quán với fix ở Phase B (xem ghi chú
+            # PRECISION FIX ở train loop Phase B), trány cross_entropy chạy bf16 thô.
+            ce   = classification_loss(student_logits.float(), labels)
             loss = ce / grad_accum
             loss.backward()
 
@@ -433,8 +434,18 @@ def train_stage3(
                 torch.cuda.empty_cache()
                 continue
 
-            kl   = kl_distillation_loss(student_logits, teacher_logits, temperature)
-            ce   = classification_loss(student_logits, labels)
+            # PRECISION FIX: kl_distillation_loss/classification_loss gọi ở đây
+            # NẰM NGOÀI _autocast_ctx (đã exit ở trên) → log_softmax/kl_div chạy
+            # trực tiếp trên bf16 (8-bit mantissa), không có fp32-auto-promote mà
+            # autocast vốn áp dụng cho các op nhạy cảm số học này KHI Ở TRONG context.
+            # bf16 thiếu chính xác ở phần đuôi phân phối → 1 sample có prob gần-0
+            # bị làm tròn cực đoan hơn thực tế → KL term nổ lên rất lớn (finite,
+            # không phải NaN nên không bị guard ở trên bắt) → val_loss spike toàn
+            # epoch dù chỉ 1 sample lỗi. Giải thích vì sao spike xảy ra ở MỌI epoch
+            # Phase B dù đã có BN recalib/warmup/seed-baseline — chưa ai sửa chỗ này.
+            # Fix: ép fp32 trước khi vào loss, đúng như autocast lẽ ra phải làm.
+            kl   = kl_distillation_loss(student_logits.float(), teacher_logits.float(), temperature)
+            ce   = classification_loss(student_logits.float(), labels)
             loss = (alpha * kl + (1 - alpha) * ce) / grad_accum
             loss.backward()
 
@@ -672,9 +683,11 @@ def _compute_val_metrics(student, teacher, val_loader, device, alpha, temperatur
         s_logits = student_logits_clips.view(B, k_copies, num_cls).mean(dim=1)
         t_logits = teacher_logits_clips.view(B, k_copies, num_cls).mean(dim=1)
 
-        # Loss & accuracy on averaged logits
-        kl   = kl_distillation_loss(s_logits, t_logits, temperature)
-        ce   = classification_loss(s_logits, labels)
+        # PRECISION FIX (xem ghi chú chi tiết ở train loop Phase B): tính loss
+        # bằng fp32, không phải bf16 thô — tránh KL nổ lên thành số lớn-nhưng-
+        # finite do mất chính xác ở đuôi phân phối khi softmax/kl_div chạy bf16.
+        kl   = kl_distillation_loss(s_logits.float(), t_logits.float(), temperature)
+        ce   = classification_loss(s_logits.float(), labels)
         loss = alpha * kl + (1 - alpha) * ce
         loss_val = loss.item()
 
