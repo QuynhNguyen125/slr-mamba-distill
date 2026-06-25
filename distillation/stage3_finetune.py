@@ -61,6 +61,19 @@ MIN_DELTA = 1e-4
 # tác giả khắc phục bằng "checkpointing, weight decay, and gradient clipping".
 SPIKE_FACTOR = 3.0
 
+# RATCHET-TRAP FIX: lr_scale *= 0.5 mỗi lần spike, KHÔNG có sàn → nếu spike
+# liên tục (quan sát thực tế: revert ở MỌI epoch Phase B), LR bị nhân nửa vô
+# hạn lần, tiến về 0 → Phase B "đông cứng" (model không còn di chuyển được,
+# nhưng vẫn tiếp tục báo spike vì best_val_loss không bao giờ được cập nhật).
+# Đặt sàn tối thiểu để model luôn còn 1 LR khả dụng để thử thoát khỏi vùng
+# bất ổn, thay vì giảm tới mức vô dụng.
+MIN_LR_SCALE = 0.1   # LR không bao giờ thấp hơn 10% giá trị ban đầu (lr truyền vào)
+# Nếu spike xảy ra liên tiếp quá nhiều lần dù đã ở sàn LR → khả năng cao
+# nguyên nhân không phải LR/gradient-noise nữa (đã giảm hết mức cho phép) mà
+# là instability cấu trúc khác (ví dụ BatchNorm noise ở batch_size nhỏ) →
+# dừng sớm để tránh lãng phí epoch, thay vì lặp vô ích đến hết patience.
+MAX_CONSECUTIVE_REVERTS = 8
+
 
 def _autocast_ctx(device):
     """bf16 autocast — theo paper (Appendix A.1: 'bf16 mixed precision' mọi stage)."""
@@ -340,6 +353,7 @@ def train_stage3(
     # FIX: dùng lr_scale tích lũy, áp lại SAU mỗi sched_b.step() để việc giảm
     # LR thực sự "dính" qua các epoch sau, không bị cosine schedule xóa.
     lr_scale = 1.0
+    consecutive_reverts = 0   # đếm số lần spike-revert LIÊN TIẾP (reset khi có epoch hợp lệ)
     if val_dataloader is not None:
         seed_val_loss, seed_val_acc = _compute_val_metrics(
             student, teacher, val_dataloader, device, alpha, temperature
@@ -437,15 +451,46 @@ def train_stage3(
                 if best_state_dict is not None and val_loss > SPIKE_FACTOR * best_val_loss:
                     spike_val_loss = val_loss   # giá trị spike TRƯỚC khi revert — log lại để thấy trên wandb
                     student.load_state_dict(best_state_dict)
-                    lr_scale *= 0.5   # tích lũy — sẽ được re-áp sau mỗi sched_b.step()
+                    consecutive_reverts += 1
+
+                    # RATCHET-TRAP FIX: chỉ halve LR nếu chưa chạm sàn — nếu không,
+                    # spike liên tục sẽ đẩy LR về ~0 và Phase B đông cứng vô ích.
+                    prev_lr_scale = lr_scale
+                    lr_scale = max(lr_scale * 0.5, MIN_LR_SCALE)
+                    actually_scaled = lr_scale / prev_lr_scale if prev_lr_scale > 0 else 1.0
                     for g in opt_b.param_groups:
-                        g["lr"] *= 0.5
+                        g["lr"] *= actually_scaled
+
+                    at_floor = " (ĐÃ CHẠM SÀN, không giảm thêm)" if lr_scale <= MIN_LR_SCALE else ""
                     print(
                         f"[Stage3-B] ⚠ Loss spike phát hiện (val_loss={val_loss:.4f} > "
                         f"{SPIKE_FACTOR}x best={best_val_loss:.4f}) → revert checkpoint, "
-                        f"giảm nửa LR (now {opt_b.param_groups[0]['lr']:.2e})"
+                        f"LR scale={lr_scale:.3f} (now {opt_b.param_groups[0]['lr']:.2e}){at_floor} "
+                        f"— revert liên tiếp lần {consecutive_reverts}/{MAX_CONSECUTIVE_REVERTS}"
                     )
                     student.train()
+
+                    if consecutive_reverts >= MAX_CONSECUTIVE_REVERTS:
+                        print(
+                            f"[Stage3-B] ⛔ Dừng sớm Phase B: {consecutive_reverts} lần spike-revert "
+                            f"LIÊN TIẾP dù LR đã ở sàn ({MIN_LR_SCALE*100:.0f}% gốc) → nguyên nhân "
+                            f"nhiều khả năng KHÔNG phải LR/gradient-noise (BatchNorm noise ở batch nhỏ, "
+                            f"hoặc instability cấu trúc khác). Dừng để tránh lãng phí epoch."
+                        )
+                        if wandb_run is not None:
+                            wandb_run.log({
+                                "stage3/epoch":      epoch_offset + epoch + 1,
+                                "stage3/train_loss": avg_loss,
+                                "stage3/train_kl":   avg_kl,
+                                "stage3/train_ce":   avg_ce,
+                                "stage3/train_acc":  train_acc,
+                                "stage3/lr":         opt_b.param_groups[0]["lr"],
+                                "stage3/phase":      1,
+                                "stage3/val_loss":   spike_val_loss,
+                                "stage3/val_acc":    val_acc,
+                                "stage3/reverted":   1,
+                            })
+                        break
                     # FIX: vẫn log epoch bị revert (đánh dấu stage3/reverted=1) thay vì
                     # "im lặng" hoàn toàn — nếu không, mọi chart (kể cả stage3/lr) sẽ
                     # mất sạch dữ liệu Phase B trong lúc đang spike liên tục, khiến
@@ -466,6 +511,11 @@ def train_stage3(
                             "stage3/reverted":   1,   # đánh dấu để filter/tô màu riêng trên wandb
                         })
                     continue  # bỏ qua phần save-checkpoint/early-stop của epoch bị revert
+
+                # Epoch hợp lệ (không bị spike-revert) → reset chuỗi revert liên tiếp,
+                # cho phép LR được halve lại từ đầu nếu có spike mới sau này (không bị
+                # "phạt" vì các lần spike cũ đã xa).
+                consecutive_reverts = 0
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
