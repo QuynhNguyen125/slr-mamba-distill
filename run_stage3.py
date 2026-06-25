@@ -55,14 +55,14 @@ SEQ_LEN     = 50
 N_JOINTS    = 55
 IN_CHANNELS = 2
 # VRAM check (nvidia-smi, 2026-06-25): GPU0/1 đang chạy 2 job song song chỉ
-# tốn 9.2GB / 14.4GB trong 24GB mỗi card (TITAN RTX) → dư rất nhiều VRAM ở
-# BATCH_SIZE=4. Tăng thẳng BATCH_SIZE THẬT lên 32 (không chỉ GRAD_ACCUM) vì
-# GRAD_ACCUM chỉ làm mượt gradient noise, KHÔNG cải thiện BatchNorm running
-# stats (BN tính trên batch thật của 1 forward-pass) — đây là hướng test trực
-# tiếp giả thuyết "BN instability ở batch nhỏ". Giữ effective batch = 64 như
-# cũ (32*2) để so sánh công bằng với các run trước.
-BATCH_SIZE  = 32
-GRAD_ACCUM  = 2     # effective batch = 32*2 = 64 (không đổi so với 4*16 trước đó)
+# tốn 9.2GB / 14.4GB trong 24GB mỗi card (TITAN RTX) lúc BATCH_SIZE=4 → tưởng
+# dư nhiều VRAM. Thử BATCH_SIZE=32 → OOM thật (cần ≥23.4GB, sát/qua biên 24GB).
+# Ước lượng: overhead cố định (model+optimizer+teacher) ~7GB + ~0.5GB/sample
+# activation → batch=32 quá sát biên, dễ OOM khi có phân mảnh hoặc job khác
+# cùng card. Hạ về 16 (vẫn gấp 4x batch cũ=4, đủ để giảm BN noise đáng kể,
+# nhưng có margin an toàn ~7+16*0.5=15GB, còn dư ~9GB cho phân mảnh/job khác).
+BATCH_SIZE  = 16
+GRAD_ACCUM  = 4     # effective batch = 16*4 = 64 (không đổi so với trước)
 NUM_WORKERS = 4
 VAL_COPIES  = 4
 
@@ -99,7 +99,7 @@ S3_LR          = 1e-4    # LR Phase B (giảm từ 2e-4: effective batch=16 quá
                           # tăng GRAD_ACCUM). Phase A dùng lr*5
 ALPHA          = 0.5     # weight KL loss; 1-ALPHA = weight CE
 TEMPERATURE    = 4.0     # distillation temperature (Hinton et al.)
-GRAD_ACCUM     = 2       # effective batch = BATCH_SIZE * GRAD_ACCUM = 32 * 2 = 64
+GRAD_ACCUM     = 4       # effective batch = BATCH_SIZE * GRAD_ACCUM = 16 * 4 = 64
 PATIENCE       = 15       # early stopping Phase B: dừng nếu val_acc không tăng (strict >, MIN_DELTA) sau N epoch
 
 LOG_FREQ = 10

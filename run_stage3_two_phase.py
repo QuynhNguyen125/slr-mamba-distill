@@ -59,9 +59,10 @@ OUTPUT_DIR = "checkpoints"
 SEQ_LEN     = 50
 N_JOINTS    = 55
 IN_CHANNELS = 2
-BATCH_SIZE  = 32    # đồng bộ với run_stage3.py: VRAM dư nhiều (xem ghi chú ở đó),
-                     # tăng batch thật để BN ổn định hơn (GRAD_ACCUM không giúp BN)
-GRAD_ACCUM  = 2     # effective batch = 32*2 = 64 (không đổi)
+BATCH_SIZE  = 16    # đồng bộ với run_stage3.py: batch=32 OOM thật (xem ghi chú ở
+                     # đó) → hạ về 16, vẫn gấp 4x batch cũ=4 để giảm BN noise,
+                     # có margin an toàn VRAM
+GRAD_ACCUM  = 4     # effective batch = 16*4 = 64 (không đổi)
 NUM_WORKERS = 4
 VAL_COPIES  = 4
 
@@ -88,7 +89,7 @@ S3_LR          = 1e-4    # giảm từ 2e-4, đồng bộ với run_stage3.py (e
                           # so với batch paper Stage 3 ~0.5M → spike ở LR 2e-4)
 ALPHA          = 0.5
 TEMPERATURE    = 4.0
-GRAD_ACCUM     = 2      # effective batch = 32 * 2 = 64
+GRAD_ACCUM     = 4      # effective batch = 16 * 4 = 64
 PATIENCE       = 15
 
 LOG_FREQ = 10
