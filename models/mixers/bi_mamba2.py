@@ -34,6 +34,8 @@ Transfer matrix for Stage-1 distillation
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from functools import partial
+from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 
 # ── mamba_ssm kernels ──────────────────────────────────────────────────
@@ -425,10 +427,31 @@ class BiMamba2Mixer(nn.Module):
         B_ssm:  torch.Tensor,
         C_ssm:  torch.Tensor,
     ) -> tuple:
-        """Pure-PyTorch fallback — returns (y_fwd, y_bwd) separately."""
+        """Pure-PyTorch fallback — returns (y_fwd, y_bwd) separately.
+
+        OOM FIX (TITAN RTX, cc7.5 → không có Triton kernel, xem _check_gpu_compatible
+        ở đầu file): _ssm_scan_pytorch là vòng lặp tuần tự qua L timestep, autograd
+        phải giữ lại state h của TỪNG timestep để backward → tốn nhớ tuyến tính theo
+        batch × L × H × P × S × N_BLOCKS × 2 hướng. Đây là nguyên nhân OOM thật (không
+        phải BatchNorm/batch-size) — OOM xảy ra ngay cả khi giảm batch vì chi phí này
+        nhân với toàn bộ 10 block cùng lúc trong 1 backward pass.
+        Fix: gradient checkpointing — không lưu state các timestep trong forward,
+        chỉ lưu input rồi TÍNH LẠI lúc backward (đổi compute lấy memory). Mỗi lần
+        chỉ 1 scan (trong 20 scans = 10 block × 2 hướng) giữ state trong bộ nhớ tại
+        một thời điểm, thay vì toàn bộ 20 cùng lúc → giảm peak memory ~bậc 10-20x.
+        Chỉ checkpoint khi cần backward (training + có grad) — Phase A (backbone
+        frozen) hoặc eval/val không cần, checkpoint lúc đó chỉ tốn thêm overhead vô ích.
+        """
         A_bar = torch.exp(-F.softplus(A_log))                   # (B, L, H)
-        y_fwd = _ssm_scan_pytorch(x_norm, A_bar, B_ssm, C_ssm, reverse=False)
-        y_bwd = _ssm_scan_pytorch(x_norm, A_bar, B_ssm, C_ssm, reverse=True)
+        use_ckpt = self.training and torch.is_grad_enabled() and x_norm.requires_grad
+        if use_ckpt:
+            fwd_fn = partial(_ssm_scan_pytorch, reverse=False)
+            bwd_fn = partial(_ssm_scan_pytorch, reverse=True)
+            y_fwd = checkpoint(fwd_fn, x_norm, A_bar, B_ssm, C_ssm, use_reentrant=False)
+            y_bwd = checkpoint(bwd_fn, x_norm, A_bar, B_ssm, C_ssm, use_reentrant=False)
+        else:
+            y_fwd = _ssm_scan_pytorch(x_norm, A_bar, B_ssm, C_ssm, reverse=False)
+            y_bwd = _ssm_scan_pytorch(x_norm, A_bar, B_ssm, C_ssm, reverse=True)
         return y_fwd, y_bwd
 
     @property

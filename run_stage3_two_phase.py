@@ -59,9 +59,10 @@ OUTPUT_DIR = "checkpoints"
 SEQ_LEN     = 50
 N_JOINTS    = 55
 IN_CHANNELS = 2
-BATCH_SIZE  = 16    # đồng bộ với run_stage3.py: batch=32 OOM thật (xem ghi chú ở
-                     # đó) → hạ về 16, vẫn gấp 4x batch cũ=4 để giảm BN noise,
-                     # có margin an toàn VRAM
+BATCH_SIZE  = 16    # đồng bộ với run_stage3.py — OOM thật do TITAN RTX (cc7.5)
+                     # rơi về fallback PyTorch tuần tự trong bi_mamba2.py, không
+                     # phải do thiếu margin VRAM. Đã fix bằng gradient checkpointing
+                     # trong _scan_pytorch (xem ghi chú chi tiết ở run_stage3.py).
 GRAD_ACCUM  = 4     # effective batch = 16*4 = 64 (không đổi)
 NUM_WORKERS = 4
 VAL_COPIES  = 4

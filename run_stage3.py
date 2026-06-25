@@ -54,13 +54,15 @@ OUTPUT_DIR = "checkpoints"
 SEQ_LEN     = 50
 N_JOINTS    = 55
 IN_CHANNELS = 2
-# VRAM check (nvidia-smi, 2026-06-25): GPU0/1 đang chạy 2 job song song chỉ
-# tốn 9.2GB / 14.4GB trong 24GB mỗi card (TITAN RTX) lúc BATCH_SIZE=4 → tưởng
-# dư nhiều VRAM. Thử BATCH_SIZE=32 → OOM thật (cần ≥23.4GB, sát/qua biên 24GB).
-# Ước lượng: overhead cố định (model+optimizer+teacher) ~7GB + ~0.5GB/sample
-# activation → batch=32 quá sát biên, dễ OOM khi có phân mảnh hoặc job khác
-# cùng card. Hạ về 16 (vẫn gấp 4x batch cũ=4, đủ để giảm BN noise đáng kể,
-# nhưng có margin an toàn ~7+16*0.5=15GB, còn dư ~9GB cho phân mảnh/job khác).
+# VRAM (2026-06-25): OOM ở batch=32 RỒI vẫn OOM ở batch=16 — không phải do
+# thiếu margin VRAM. Root cause thật (xem models/mixers/bi_mamba2.py
+# _check_gpu_compatible + _scan_pytorch): TITAN RTX là compute capability 7.5,
+# dưới mức 8.0 mà Triton kernel (mamba_chunk_scan_combined) yêu cầu → mọi scan
+# SSM rơi về fallback PyTorch tuần tự (_ssm_scan_pytorch), vòng for-loop giữ
+# state mọi timestep cho backward — tốn nhớ tuyến tính theo
+# batch × L × N_BLOCKS × 2 hướng, không liên quan batch-size "an toàn" nào cả.
+# Đã fix bằng gradient checkpointing trong _scan_pytorch (tính lại thay vì lưu
+# state mọi timestep) → batch=16 giờ chạy được với margin rộng hơn nhiều.
 BATCH_SIZE  = 16
 GRAD_ACCUM  = 4     # effective batch = 16*4 = 64 (không đổi so với trước)
 NUM_WORKERS = 4
