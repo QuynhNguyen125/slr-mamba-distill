@@ -399,6 +399,19 @@ def train_stage3(
     # LR thực sự "dính" qua các epoch sau, không bị cosine schedule xóa.
     lr_scale = 1.0
     consecutive_reverts = 0   # đếm số lần spike-revert LIÊN TIẾP (reset khi có epoch hợp lệ)
+    # OPTIMIZER-STATE BUG (root cause thật của "spike lặp lại mọi epoch dù đã
+    # revert + giảm LR, kể cả khi LR chạm sàn"): revert ở dưới CHỈ load lại
+    # student.state_dict() — opt_b (AdamW) vẫn giữ exp_avg/exp_avg_sq từ đúng
+    # batch gây spike. Ngay step đầu tiên sau revert, Adam áp lại y nguyên
+    # hướng/độ lớn update đã gây nổ loss lên TRÊN BỘ WEIGHT vừa được phục hồi
+    # → tái tạo lại spike gần như y hệt, lặp lại mỗi epoch, không liên quan
+    # gì đến việc LR đã giảm bao nhiêu (vì bias-corrected Adam step ở vài bước
+    # đầu gần như là signSGD, không tỉ lệ thuận đơn giản với LR). Đây giải
+    # thích vì sao 8 lần revert liên tiếp đều thất bại dù LR chạm sàn 1e-5.
+    # FIX: lưu + khôi phục opt_b.state_dict() ĐỒNG BỘ với student.state_dict()
+    # — revert phải đưa cả model VÀ optimizer về đúng điểm "tốt cuối cùng",
+    # không chỉ riêng model.
+    best_optimizer_state = None
     if val_dataloader is not None:
         seed_val_loss, seed_val_acc = _compute_val_metrics(
             student, teacher, val_dataloader, device, alpha, temperature
@@ -406,6 +419,7 @@ def train_stage3(
         if seed_val_loss == seed_val_loss and seed_val_loss != float("inf"):
             best_val_loss = seed_val_loss
             best_state_dict = copy.deepcopy(student.state_dict())
+            best_optimizer_state = copy.deepcopy(opt_b.state_dict())
             print(
                 f"[Stage3-B] Seeded spike-revert baseline (post-BN-recalib): "
                 f"val_loss={seed_val_loss:.4f}  val_acc={seed_val_acc*100:.2f}%"
@@ -506,6 +520,21 @@ def train_stage3(
                 if best_state_dict is not None and val_loss > SPIKE_FACTOR * best_val_loss:
                     spike_val_loss = val_loss   # giá trị spike TRƯỚC khi revert — log lại để thấy trên wandb
                     student.load_state_dict(best_state_dict)
+                    # OPTIMIZER-STATE FIX (xem ghi chú ở chỗ khởi tạo best_optimizer_state):
+                    # revert model KHÔNG đủ — phải đưa opt_b về đúng exp_avg/exp_avg_sq
+                    # tại thời điểm best checkpoint, nếu không Adam sẽ ngay lập tức áp lại
+                    # update đã gây spike lên weight vừa phục hồi.
+                    # CHÚ Ý: opt_b.load_state_dict() cũng nạp lại "lr" lưu trong
+                    # param_groups tại thời điểm snapshot — phải giữ lại LR HIỆN TẠI
+                    # (đã bị halve qua các lần revert trước) rồi gán lại sau khi load,
+                    # nếu không sẽ vô tình "hoàn tác" việc giảm LR tích lũy ở dưới.
+                    current_lrs = [g["lr"] for g in opt_b.param_groups]
+                    if best_optimizer_state is not None:
+                        opt_b.load_state_dict(best_optimizer_state)
+                    else:
+                        opt_b.state.clear()
+                    for g, _lr in zip(opt_b.param_groups, current_lrs):
+                        g["lr"] = _lr
                     consecutive_reverts += 1
 
                     # RATCHET-TRAP FIX: chỉ halve LR nếu chưa chạm sàn — nếu không,
@@ -575,6 +604,9 @@ def train_stage3(
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_state_dict = copy.deepcopy(student.state_dict())
+                    # Snapshot optimizer momentum cùng lúc với model — xem ghi chú
+                    # OPTIMIZER-STATE FIX ở chỗ khởi tạo best_optimizer_state.
+                    best_optimizer_state = copy.deepcopy(opt_b.state_dict())
 
         val_str = ""
         if val_loss is not None:
