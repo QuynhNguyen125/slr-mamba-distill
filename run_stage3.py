@@ -58,7 +58,8 @@ IN_CHANNELS = 2
 # BATCH_SIZE từ 2 lên 4 để BN có nhiều sample/forward-pass hơn (ổn định hơn).
 # Nếu vẫn OOM trên GPU thực tế, hạ về 2 nhưng KHÔNG hạ S3_LR (xem ghi chú dưới).
 BATCH_SIZE  = 4
-GRAD_ACCUM  = 4    # Effective batch = BATCH_SIZE * GRAD_ACCUM = 16
+GRAD_ACCUM  = 16    # tăng từ 4 → 16: effective batch 16→64, giảm noise gradient/step
+                     # (mọi epoch Phase B đang bị spike-revert ở effective batch=16)
 NUM_WORKERS = 4
 VAL_COPIES  = 4
 
@@ -89,7 +90,7 @@ S3_LR          = 1e-4    # LR Phase B (giảm từ 2e-4: effective batch=16 quá
                           # tăng GRAD_ACCUM). Phase A dùng lr*5
 ALPHA          = 0.5     # weight KL loss; 1-ALPHA = weight CE
 TEMPERATURE    = 4.0     # distillation temperature (Hinton et al.)
-GRAD_ACCUM     = 4       # effective batch = BATCH_SIZE * GRAD_ACCUM = 4 * 4 = 16
+GRAD_ACCUM     = 16      # effective batch = BATCH_SIZE * GRAD_ACCUM = 4 * 16 = 64
 PATIENCE       = 15       # early stopping Phase B: dừng nếu val_acc không tăng (strict >, MIN_DELTA) sau N epoch
 
 LOG_FREQ = 10
