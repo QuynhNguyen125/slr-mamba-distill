@@ -185,6 +185,8 @@ def train_stage3(
     patience: int = 15,
     wandb_run=None,
     save_path: str = None,
+    weight_decay: float = 0.1,
+    phase_b_warmup_epochs: int = 2,
 ):
     """
     2-phase Stage 3:
@@ -348,12 +350,15 @@ def train_stage3(
     _recalibrate_bn(student, dataloader, device, num_batches=30)
     student.train()
 
-    WARMUP_EPOCHS = 2
+    # OPTUNA HOOK: warmup_epochs/weight_decay giờ là tham số (default giữ
+    # nguyên giá trị cũ 2 / 0.1 cho run_stage3.py, run_stage3_two_phase.py —
+    # không đổi behavior). run_stage3_optuna.py truyền giá trị Optuna tìm được.
+    WARMUP_EPOCHS = phase_b_warmup_epochs
     # REBUILD FIX: paper (Appendix A.1) dùng LR ổn định ~2e-4 cho Stage 3 và
     # weight_decay=0.1. Bản cũ dùng lr*0.1 (→ 1e-5 thực tế) + wd=0.01: LR quá
     # nhỏ khiến model gần như không học (train_kl/ce flatline suốt Phase B).
     # Caller (run_stage3.py) truyền `lr` = LR thực tế muốn dùng cho Phase B.
-    opt_b = optim.AdamW(student.parameters(), lr=lr, weight_decay=0.1, betas=(0.9, 0.95))
+    opt_b = optim.AdamW(student.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95))
 
     def lr_lambda(epoch):
         if epoch < WARMUP_EPOCHS:
