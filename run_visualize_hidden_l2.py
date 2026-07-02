@@ -11,7 +11,20 @@ Sự khác biệt so với run_visualize_stage2.py (hiện tại chỉ plot tran
 Cách dùng:
     python run_visualize_hidden_l2.py
 
-Output: visualizations_hidden_l2/hidden_l2_comparison.png
+Output:
+    - visualizations_hidden_l2/hidden_l2_comparison.png  (local)
+    - wandb run "slr-mamba-distill / hidden-l2-eval"     (online)
+        Charts:
+            hidden_l2/stage1_block_{l}    — L2 per block sau Stage 1
+            hidden_l2/stage2_block_{l}    — L2 per block sau Stage 2
+            hidden_l2/improvement_block_{l} — % giảm per block
+            hidden_l2/mean_l2_stage1      — tổng trung bình Stage 1
+            hidden_l2/mean_l2_stage2      — tổng trung bình Stage 2
+            hidden_l2/overall_improvement — % cải thiện tổng
+        Tables:
+            hidden_l2/per_block_table     — bảng so sánh đầy đủ
+        Images:
+            hidden_l2/comparison_chart    — PNG tổng hợp
 """
 
 import os, sys, warnings, logging
@@ -73,6 +86,11 @@ OUTPUT_DIR = "visualizations_hidden_l2"
 #   freeze_mlp=False → target = block_outputs[l]   (full block output)
 #   freeze_mlp=True  → target = pre_ffn_states[l]  (trước FFN)
 FREEZE_MLP = False   # ← đổi thành True nếu bạn train với freeze_mlp=True
+
+# ── Wandb ─────────────────────────────────────────────────────────────
+USE_WANDB     = True
+WANDB_PROJECT = "slr-mamba-distill"
+WANDB_NAME    = "hidden-l2-eval"   # tên run trên wandb
 
 # ══════════════════════════════════════════════════════════════════════
 
@@ -242,6 +260,77 @@ def plot_results(l2_stage1, l2_stage2, freeze_mlp, output_path):
     return mean_s1, mean_s2, overall
 
 
+def log_to_wandb(wandb_run, l2_s1, l2_s2, improvement, mean_s1, mean_s2, overall, img_path):
+    """
+    Log tất cả kết quả lên wandb:
+        - Scalar per block (Stage 1, Stage 2, improvement%)
+        - Summary scalars (mean + overall improvement)
+        - Interactive Table (per-block comparison)
+        - PNG image
+        - wandb.plot.bar() cho cái nhìn trực quan hơn
+    """
+    import wandb
+
+    log_dict = {}
+
+    # ── 1. Scalars per block ───────────────────────────────────────────
+    for l in range(N_BLOCKS):
+        log_dict[f"hidden_l2/stage1_block_{l:02d}"] = float(l2_s1[l])
+        log_dict[f"hidden_l2/stage2_block_{l:02d}"] = float(l2_s2[l])
+        log_dict[f"hidden_l2/improvement_block_{l:02d}"] = float(improvement[l])
+
+    # ── 2. Summary scalars ────────────────────────────────────────────
+    log_dict["hidden_l2/mean_l2_stage1"]      = float(mean_s1)
+    log_dict["hidden_l2/mean_l2_stage2"]      = float(mean_s2)
+    log_dict["hidden_l2/overall_improvement"] = float(overall)
+
+    # ── 3. PNG image ──────────────────────────────────────────────────
+    if os.path.exists(img_path):
+        log_dict["hidden_l2/comparison_chart"] = wandb.Image(
+            img_path,
+            caption=f"Hidden State L2: Stage1 mean={mean_s1:.4f} → Stage2 mean={mean_s2:.4f} ({overall:+.1f}%)"
+        )
+
+    # ── 4. Interactive Table — dễ sort, filter trên wandb UI ──────────
+    table = wandb.Table(columns=["block", "stage1_l2", "stage2_l2", "improvement_%", "result"])
+    for l in range(N_BLOCKS):
+        result = "better" if improvement[l] > 0 else "worse"
+        table.add_data(l, round(float(l2_s1[l]), 4), round(float(l2_s2[l]), 4),
+                       round(float(improvement[l]), 2), result)
+    log_dict["hidden_l2/per_block_table"] = table
+
+    # ── 5. wandb Bar charts — dùng wandb.plot.bar() cho interactive view ──
+    # Stage 1 bar chart
+    s1_table = wandb.Table(data=[[f"block_{l}", float(l2_s1[l])] for l in range(N_BLOCKS)],
+                           columns=["block", "L2_distance"])
+    log_dict["hidden_l2/bar_stage1"] = wandb.plot.bar(
+        s1_table, "block", "L2_distance", title="Hidden L2 — After Stage 1"
+    )
+
+    # Stage 2 bar chart
+    s2_table = wandb.Table(data=[[f"block_{l}", float(l2_s2[l])] for l in range(N_BLOCKS)],
+                           columns=["block", "L2_distance"])
+    log_dict["hidden_l2/bar_stage2"] = wandb.plot.bar(
+        s2_table, "block", "L2_distance", title="Hidden L2 — After Stage 2"
+    )
+
+    # Improvement bar chart
+    imp_table = wandb.Table(data=[[f"block_{l}", float(improvement[l])] for l in range(N_BLOCKS)],
+                            columns=["block", "improvement_%"])
+    log_dict["hidden_l2/bar_improvement"] = wandb.plot.bar(
+        imp_table, "block", "improvement_%", title="L2 Improvement Stage1→Stage2 (%)"
+    )
+
+    # ── 6. wandb.summary — hiện ngay trên project overview ───────────
+    wandb_run.summary["hidden_l2/mean_stage1"]       = float(mean_s1)
+    wandb_run.summary["hidden_l2/mean_stage2"]       = float(mean_s2)
+    wandb_run.summary["hidden_l2/overall_improvement_%"] = float(overall)
+    wandb_run.summary["freeze_mlp"]                  = FREEZE_MLP
+
+    wandb_run.log(log_dict)
+    print(f"[Wandb] Logged → {wandb_run.url}")
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -254,6 +343,27 @@ def main():
     from sstan.dataset import Sign_Dataset
     from sstan.datamodule import collate_fn
     from models.teacher import TeacherModel
+
+    # ── Wandb init ────────────────────────────────────────────────────
+    wandb_run = None
+    if USE_WANDB:
+        import wandb
+        target_key = get_target_key(FREEZE_MLP)
+        wandb_run = wandb.init(
+            project=WANDB_PROJECT,
+            name=WANDB_NAME,
+            config=dict(
+                n_batches=N_BATCHES,
+                batch_size=BATCH_SIZE,
+                freeze_mlp=FREEZE_MLP,
+                target_key=target_key,
+                student_stage1_ckpt=STUDENT_STAGE1_CKPT,
+                student_stage2_ckpt=STUDENT_STAGE2_CKPT,
+                n_blocks=N_BLOCKS,
+            ),
+            settings=wandb.Settings(console="off"),
+        )
+        print(f"Wandb : {wandb_run.url}\n")
 
     # ── Dataset ───────────────────────────────────────────────────────
     print("Loading dataset...")
@@ -325,17 +435,19 @@ def main():
     print("[2/2] Stage 2 L2 distance...")
     l2_s2 = compute_l2_per_block(student2, teacher, val_loader, N_BATCHES, DEVICE, FREEZE_MLP)
 
+    improvement = (l2_s1 - l2_s2) / (l2_s1 + 1e-8) * 100
+    mean_s1 = l2_s1.mean()
+    mean_s2 = l2_s2.mean()
+    overall = float((mean_s1 - mean_s2) / mean_s1 * 100)
+
     # ── Console summary ───────────────────────────────────────────────
     print("\n" + "="*65)
     print(f"{'Block':>6} | {'Stage1 L2':>10} | {'Stage2 L2':>10} | {'Δ%':>8}")
     print("-"*65)
     for l in range(N_BLOCKS):
-        delta = (l2_s1[l] - l2_s2[l]) / (l2_s1[l] + 1e-8) * 100
-        mark = "▲ better" if delta > 0 else "▼ worse "
-        print(f"{l:>6} | {l2_s1[l]:>10.4f} | {l2_s2[l]:>10.4f} | {delta:>+7.1f}%  {mark}")
+        mark = "▲ better" if improvement[l] > 0 else "▼ worse "
+        print(f"{l:>6} | {l2_s1[l]:>10.4f} | {l2_s2[l]:>10.4f} | {improvement[l]:>+7.1f}%  {mark}")
     print("="*65)
-    mean_s1 = l2_s1.mean(); mean_s2 = l2_s2.mean()
-    overall = (mean_s1 - mean_s2) / mean_s1 * 100
     print(f"{'MEAN':>6} | {mean_s1:>10.4f} | {mean_s2:>10.4f} | {overall:>+7.1f}%")
     print("="*65)
 
@@ -348,9 +460,15 @@ def main():
     else:
         print("✗ Stage 2 không giúp ích — L2 không giảm. Kiểm tra FREEZE_MLP và checkpoint.")
 
-    # ── Plot ──────────────────────────────────────────────────────────
+    # ── Plot (local PNG) ──────────────────────────────────────────────
     out_path = os.path.join(OUTPUT_DIR, "hidden_l2_comparison.png")
     plot_results(l2_s1, l2_s2, FREEZE_MLP, out_path)
+
+    # ── Log to wandb ──────────────────────────────────────────────────
+    if wandb_run is not None:
+        log_to_wandb(wandb_run, l2_s1, l2_s2, improvement,
+                     mean_s1, mean_s2, overall, out_path)
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
